@@ -737,10 +737,9 @@ class HybridRAG:
     - Используй ТОЛЬКО тот номер страницы, который есть в контексте.
     - НЕ ПРИДУМЫВАЙ номера страниц, которых нет в контексте.
     - Если в контексте нет номера страницы — не пиши его.
-    5. Обязательно укажи источник информации (Приложение, раздел, страницу из контекста).
-    6. Если есть связи между сущностями — укажи их.
-    7. НЕ ПИШИ "нет информации", если в контексте есть ответ.
-    8. Ответь на русском языке, вежливо и профессионально.
+    5. Если есть связи между сущностями — укажи их.
+    6. НЕ ПИШИ "нет информации", если в контексте есть ответ.
+    7. Ответь на русском языке, вежливо и профессионально.
 
     ОТВЕТ (развернуто, с указанием источника из контекста):"""
         prompt = PromptTemplate(template_str)
@@ -802,7 +801,6 @@ class HybridRAG:
             # ============================================================
             # ИЗВЛЕКАЕМ НОМЕР СТРАНИЦЫ ИЗ ЗАПРОСА
             # ============================================================
-            import re
             page_match = re.search(r'(\d+)\s*страниц[еы]|страниц[еы]\s*(\d+)', question, re.IGNORECASE)
             requested_page = None
             if page_match:
@@ -811,6 +809,39 @@ class HybridRAG:
             
             response = self.query_engine.query(question)
             answer = str(response)
+            
+            # ============================================================
+            # АГРЕССИВНАЯ ОЧИСТКА ОТ [Страница X] И ДУБЛИРОВАНИЙ
+            # ============================================================
+            # 1. Заменяем [Страница X] на "странице X"
+            answer = re.sub(r'\[Страница\s+(\d+)\]', r'странице \1', answer)
+            answer = re.sub(r'\[OCR Страница\s+(\d+)\]', r'странице \1', answer)
+            
+            # 2. Убираем дублирование "странице странице" → "странице"
+            answer = re.sub(r'странице\s+странице', r'странице', answer, flags=re.IGNORECASE)
+            answer = re.sub(r'страница\s+страница', r'страница', answer, flags=re.IGNORECASE)
+            answer = re.sub(r'На\s+странице\s+странице', r'На странице', answer, flags=re.IGNORECASE)
+            
+            # 3. Убираем "На странице [Страница 16]" → "На странице 16"
+            answer = re.sub(r'На\s+странице\s+\[Страница\s+(\d+)\]', r'На странице \1', answer, flags=re.IGNORECASE)
+            answer = re.sub(r'странице\s+\[Страница\s+(\d+)\]', r'странице \1', answer, flags=re.IGNORECASE)
+            
+            # 4. Убираем "[Страница X] находится" → "находится на странице X"
+            answer = re.sub(r'\[Страница\s+(\d+)\]\s+находится', r'находится на странице \1', answer)
+            
+            # 5. Убираем "страница 16 находится" → "находится на странице 16"
+            answer = re.sub(r'страница\s+(\d+)\s+находится', r'находится на странице \1', answer, flags=re.IGNORECASE)
+            
+            # 6. Убираем лишние пробелы
+            answer = re.sub(r'\s+', ' ', answer)
+            answer = answer.strip()
+            
+            # 7. Если ответ начинается с "На странице странице" - исправляем
+            answer = re.sub(r'^На\s+странице\s+странице', r'На странице', answer, flags=re.IGNORECASE)
+            answer = re.sub(r'^На\s+странице\s+(\d+)', r'На странице \1', answer, flags=re.IGNORECASE)
+            
+            # 8. Если есть "[Страница X]" в любом месте - заменяем на "страница X"
+            answer = re.sub(r'\[Страница\s+(\d+)\]', r'страница \1', answer)
             
             # ============================================================
             # СБОР ИСТОЧНИКОВ
@@ -826,16 +857,13 @@ class HybridRAG:
                         node_text = None
                         node_page = None
                         
-                        # 1. Пробуем из node.text
                         if hasattr(node, 'text') and node.text:
                             node_text = node.text
                         
-                        # 2. Пробуем из node.node.text
                         if not node_text and hasattr(node, 'node'):
                             if hasattr(node.node, 'text') and node.node.text:
                                 node_text = node.node.text
                         
-                        # 3. Пробуем из docstore по node_id
                         if not node_text:
                             node_id = None
                             if hasattr(node, 'node') and hasattr(node.node, 'node_id'):
@@ -849,13 +877,9 @@ class HybridRAG:
                                     node_text = doc.text
                                     logger.debug(f"✅ Текст из docstore по ID {node_id}")
                         
-                        # ============================================================
-                        # ИЗВЛЕКАЕМ СТРАНИЦУ ИЗ МЕТАДАННЫХ ИЛИ ТЕКСТА
-                        # ============================================================
                         if hasattr(node, 'metadata'):
                             node_page = node.metadata.get('page')
                         
-                        # Если не нашли в метаданных, ищем в тексте
                         if not node_page and node_text:
                             page_in_text = re.search(r'\[Страница (\d+)\]', node_text)
                             if page_in_text:
@@ -866,10 +890,9 @@ class HybridRAG:
                                 "text": node_text,
                                 "score": float(node.score) if hasattr(node, 'score') and node.score is not None else None,
                                 "metadata": node.metadata if hasattr(node, 'metadata') else {},
-                                "page": node_page,  # ← ДОБАВЛЯЕМ СТРАНИЦУ
+                                "page": node_page,
                             }
                             
-                            # Проверяем, не из графа ли источник
                             if source['metadata'].get('source') == 'graph':
                                 logger.info(f"   🌐 Графовый источник: {node_text[:100]}...")
                             
@@ -887,35 +910,27 @@ class HybridRAG:
                     logger.info(f"   Первый источник: {first_text}... (страница: {first_page})")
             
             # ============================================================
-            # ФИЛЬТРАЦИЯ ПО СТРАНИЦЕ (если запрошена)
+            # ФИЛЬТРАЦИЯ ПО СТРАНИЦЕ
             # ============================================================
             if requested_page:
-                # Фильтруем источники по странице
                 filtered_sources = [s for s in sources if s.get('page') == requested_page]
                 if filtered_sources:
                     sources = filtered_sources
                     logger.info(f"📄 Отфильтровано {len(sources)} источников на странице {requested_page}")
                 else:
                     logger.warning(f"⚠️ Нет источников на странице {requested_page}")
-                    # Обновляем ответ, чтобы пользователь знал
                     if "нет информации" not in answer.lower():
-                        # Проверяем, есть ли в ответе упоминание другой страницы
                         page_in_answer = re.search(r'(\d+)\s*страниц[еы]', answer)
                         if page_in_answer:
                             wrong_page = int(page_in_answer.group(1))
                             if wrong_page != requested_page:
-                                # Убираем неправильную страницу из ответа
                                 answer = answer.replace(f"на странице {wrong_page}", "").replace(f"на {wrong_page} странице", "").strip()
-                                # Добавляем информацию о том, что информация не найдена
                                 if not answer:
                                     answer = f"Информация на странице {requested_page} не найдена. Проверьте правильность номера страницы."
             
             # ============================================================
-            # ПОСТ-ОБРАБОТКА: Исправляем ответ, если LLM ошиблась
+            # ПОСТ-ОБРАБОТКА
             # ============================================================
-            has_forbidden = "ЗАПРЕЩЕНО" in sources_text
-            has_allow = "РАЗРЕШЕНО" in sources_text
-            
             if "нет информации" in answer.lower() and sources:
                 logger.info("🔧 LLM сказал 'нет информации', но есть источники. Исправляем...")
                 
@@ -949,14 +964,9 @@ class HybridRAG:
                             logger.info(f"🔧 Исправлен ответ (Приложение 2): {answer}")
                             break
             
-            # ============================================================
-            # ДОБАВЛЯЕМ СТРАНИЦУ В ОТВЕТ, ЕСЛИ ЕЕ НЕТ
-            # ============================================================
             if sources and not re.search(r'страниц[еы]', answer, re.IGNORECASE):
-                # Если в ответе нет номера страницы, но есть источники
                 page_from_source = sources[0].get('page')
                 if page_from_source:
-                    # Проверяем, не упоминается ли уже страница в ответе
                     if not re.search(rf'{page_from_source}\s*страниц[еы]', answer, re.IGNORECASE):
                         answer = f"{answer} (страница {page_from_source})"
             

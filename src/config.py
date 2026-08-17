@@ -87,7 +87,7 @@ class Config:
     # Размеры чанков
     CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 500))
     CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 100))
-    SEARCH_K = int(os.getenv("SEARCH_K", 15))  # ← Увеличиваем для лучшего поиска
+    SEARCH_K = int(os.getenv("SEARCH_K", 5))
     
     # ================================================================
     # ПУТИ ДЛЯ ХРАНЕНИЯ

@@ -14,7 +14,7 @@ from typing import Dict, List, Any
 from datetime import datetime
 import tempfile
 import os
-import subprocess
+
 
 from pdf2image import convert_from_path
 from src.config import Config
@@ -34,15 +34,6 @@ try:
 except ImportError:
     logger.warning("⚠️ EasyOCR не установлен")
 
-# Проверка Aspose.Words для .doc файлов
-ASPOSE_AVAILABLE = False
-try:
-    import aspose.words as aw
-    ASPOSE_AVAILABLE = True
-    logger.info("✅ Aspose.Words доступен для .doc файлов")
-except ImportError:
-    logger.warning("⚠️ Aspose.Words не установлен")
-
 # Проверка docx2txt для извлечения картинок из docx
 DOCX2TXT_AVAILABLE = False
 try:
@@ -51,16 +42,6 @@ try:
     logger.info("✅ docx2txt доступен")
 except ImportError:
     logger.warning("⚠️ docx2txt не установлен")
-
-# Проверка antiword для .doc файлов (fallback)
-ANTIWORD_AVAILABLE = False
-try:
-    result = subprocess.run(['antiword', '-v'], capture_output=True, text=True)
-    if result.returncode == 0:
-        ANTIWORD_AVAILABLE = True
-        logger.info("✅ Antiword доступен для .doc файлов")
-except FileNotFoundError:
-    logger.warning("⚠️ Antiword не установлен (установите: brew install antiword или apt-get install antiword)")
 
 
 class DocumentParser:
@@ -385,12 +366,55 @@ class DocumentParser:
                 else:
                     result['text'] = result['ocr_text']
                 logger.info(f"  📊 Добавлено {len(result['ocr_text'])} символов OCR текста")
-
+            
+            # ============================================================
+            # ШАГ 6: ИЗВЛЕКАЕМ ЗАГОЛОВКИ ИЗ ТЕКСТА
+            # ============================================================
+            headers = []
+            header_patterns = [
+                r'^(?:#+\s*)?([А-ЯЁ][А-ЯЁ\s\d.]+[А-ЯЁ])$',  # ВСЕ ЗАГЛАВНЫЕ
+                r'^(?:#+\s*)?(\d+\.\d+\s+[А-ЯЁ][а-яё\s\d]+)$',  # 1.1 Название
+                r'^(?:#+\s*)?(\d+\s+[А-ЯЁ][а-яё\s\d]+)$',  # 1 Название
+                r'^(?:#+\s*)?([А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)$',  # Слово Слово Слово
+                r'^(?:#+\s*)?(Приложение\s+\d+[\.\s]*[А-ЯЁа-яё\s\d]+)$',  # Приложение 1 Название
+            ]
+            
+            for page_num, page_text in text_by_page.items():
+                lines = page_text.split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if not line or len(line) < 5 or len(line) > 200:
+                        continue
+                    
+                    # Проверяем по паттернам
+                    for pattern in header_patterns:
+                        match = re.match(pattern, line, re.IGNORECASE)
+                        if match:
+                            header_text = match.group(1).strip()
+                            # Проверяем, что это не просто цифры
+                            if not re.match(r'^\d+$', header_text):
+                                # Проверяем, что это не конец предложения
+                                if not re.search(r'[.!?]$', header_text):
+                                    headers.append({
+                                        'page': page_num,
+                                        'header': header_text,
+                                        'level': self._detect_header_level(header_text, pattern)
+                                    })
+                                    break
+            
+            if headers:
+                result['metadata']['headers'] = headers
+                result['metadata']['header_count'] = len(headers)
+                logger.info(f"  📑 Извлечено заголовков: {len(headers)}")
+            
+            # ============================================================
+            # ШАГ 7: СОХРАНЯЕМ ИНФОРМАЦИЮ О СТРАНИЦАХ В МЕТАДАННЫЕ
+            # ============================================================
             if text_by_page:
                 result['metadata']['page_texts'] = text_by_page
                 result['metadata']['page_count'] = len(text_by_page)
                 result['metadata']['pages'] = list(text_by_page.keys())
-            logger.info(f"  📄 Сохранена информация о {len(text_by_page)} страницах в метаданные")
+                logger.info(f"  📄 Сохранена информация о {len(text_by_page)} страницах в метаданные")
             
             logger.info(f"✅ ГИБРИДНЫЙ парсинг завершен: {len(result['text'])} символов всего")
             logger.info(f"   📊 Таблиц: {len(result['tables'])}, 🖼️ Изображений: {len(images_data)}, Camelot: {result['extraction_details']['camelot_tables']}")
@@ -400,6 +424,18 @@ class DocumentParser:
             logger.error(f"❌ Ошибка парсинга: {e}", exc_info=True)
             result['metadata']['error'] = str(e)
             return result
+
+    def _detect_header_level(self, header: str, pattern: str) -> int:
+        """Определяет уровень заголовка на основе паттерна"""
+        if 'Приложение' in header:
+            return 1
+        if re.match(r'^\d+\.\d+\s', header):
+            return 3
+        if re.match(r'^\d+\s', header):
+            return 2
+        if header.isupper() and len(header) > 5:
+            return 1
+        return 2
 
     def _format_table(self, table: List[List[str]]) -> str:
         """Форматирует таблицу для текстового представления"""
@@ -491,11 +527,24 @@ class DocumentParser:
             
             # Извлекаем параграфы
             paragraphs = []
+            headers = []
             for para in doc.paragraphs:
-                if para.text.strip():
-                    paragraphs.append(para.text)
+                text = para.text.strip()
+                if text:
+                    paragraphs.append(text)
+                    # Проверяем, является ли параграф заголовком
+                    if self._is_header(text):
+                        headers.append({
+                            'header': text,
+                            'level': self._detect_header_level_from_text(text)
+                        })
             
             result['extraction_details']['paragraphs'] = len(paragraphs)
+            
+            if headers:
+                result['metadata']['headers'] = headers
+                result['metadata']['header_count'] = len(headers)
+                logger.info(f"  📑 Извлечено заголовков из DOCX: {len(headers)}")
             
             # Извлекаем таблицы
             tables_text = []
@@ -567,8 +616,38 @@ class DocumentParser:
             result['metadata']['error'] = str(e)
             return result
     
+    def _is_header(self, text: str) -> bool:
+        """Проверяет, является ли текст заголовком"""
+        if not text or len(text) < 3:
+            return False
+        
+        # Проверяем паттерны заголовков
+        patterns = [
+            r'^[А-ЯЁ][А-ЯЁ\s\d.]+[А-ЯЁ]$',  # ВСЕ ЗАГЛАВНЫЕ
+            r'^\d+\.\d+\s+[А-ЯЁ][а-яё]',  # 1.1 Название
+            r'^\d+\s+[А-ЯЁ][а-яё]',  # 1 Название
+            r'^Приложение\s+\d+',  # Приложение 1
+        ]
+        
+        for pattern in patterns:
+            if re.match(pattern, text, re.IGNORECASE):
+                return True
+        return False
+    
+    def _detect_header_level_from_text(self, text: str) -> int:
+        """Определяет уровень заголовка"""
+        if 'Приложение' in text:
+            return 1
+        if re.match(r'^\d+\.\d+\s', text):
+            return 3
+        if re.match(r'^\d+\s', text):
+            return 2
+        if text.isupper() and len(text) > 5:
+            return 1
+        return 2
+    
     def _parse_doc(self, file_path: Path) -> Dict[str, Any]:
-        """Парсинг старого DOC файла"""
+        """Парсинг старого DOC файла через бинарный экстрактор"""
         logger.info(f"📄 Парсинг DOC: {file_path.name}")
         
         result = {
@@ -590,25 +669,7 @@ class DocumentParser:
             }
         }
         
-        # Способ 1: Antiword
-        if ANTIWORD_AVAILABLE:
-            try:
-                result_text = subprocess.run(
-                    ['antiword', str(file_path)],
-                    capture_output=True,
-                    text=True
-                )
-                
-                if result_text.returncode == 0 and result_text.stdout.strip():
-                    result['text'] = self._clean_text(result_text.stdout)
-                    result['extraction_details']['processor'] = 'antiword'
-                    result['extraction_details']['success'] = True
-                    logger.info(f"✅ DOC спарсен через Antiword: {len(result['text'])} символов")
-                    return result
-            except Exception as e:
-                logger.warning(f"  Ошибка Antiword: {e}")
-        
-        # Способ 3: Бинарный экстрактор
+        # Способ 1: Бинарный экстрактор
         try:
             with open(file_path, 'rb') as f:
                 content = f.read()
@@ -628,9 +689,27 @@ class DocumentParser:
                             continue
                 
                 if text_parts:
-                    result['text'] = self._clean_text('\n'.join(text_parts))
+                    full_text = '\n'.join(text_parts)
+                    result['text'] = self._clean_text(full_text)
                     result['extraction_details']['processor'] = 'binary_extract'
                     result['extraction_details']['success'] = True
+                    
+                    # Извлекаем заголовки из текста
+                    headers = []
+                    lines = full_text.split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        if self._is_header(line):
+                            headers.append({
+                                'header': line,
+                                'level': self._detect_header_level_from_text(line)
+                            })
+                    
+                    if headers:
+                        result['metadata']['headers'] = headers
+                        result['metadata']['header_count'] = len(headers)
+                        logger.info(f"  📑 Извлечено заголовков из DOC: {len(headers)}")
+                    
                     logger.info(f"✅ DOC спарсен через бинарный экстрактор: {len(result['text'])} символов")
                     return result
         except Exception as e:
@@ -690,6 +769,23 @@ class DocumentParser:
                                 break
                         except:
                             continue
+            
+            # Извлекаем заголовки из TXT
+            if result['text']:
+                headers = []
+                lines = result['text'].split('\n')
+                for line in lines:
+                    line = line.strip()
+                    if self._is_header(line):
+                        headers.append({
+                            'header': line,
+                            'level': self._detect_header_level_from_text(line)
+                        })
+                
+                if headers:
+                    result['metadata']['headers'] = headers
+                    result['metadata']['header_count'] = len(headers)
+                    logger.info(f"  📑 Извлечено заголовков из TXT: {len(headers)}")
             
             logger.info(f"✅ TXT спарсен: {len(result['text'])} символов")
         except Exception as e:
@@ -874,6 +970,8 @@ class DocumentParser:
                         logger.info(f"  ✅ Добавлен: {len(doc_data['text'])} символов текста, {len(doc_data.get('tables', []))} таблиц")
                         if has_ocr:
                             logger.info(f"     + OCR: {len(doc_data['ocr_text'])} символов")
+                        if doc_data.get('metadata', {}).get('headers'):
+                            logger.info(f"     + Заголовков: {len(doc_data['metadata']['headers'])}")
                     else:
                         logger.warning(f"  ⚠️ Пустой документ: {file_path.name}")
         
