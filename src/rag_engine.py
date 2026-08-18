@@ -5,16 +5,18 @@ import pickle
 import hashlib
 import json
 from pathlib import Path
-from typing import Optional, Dict, Any, List 
+from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 import logging
 import time
 import re
-from llama_index.core.storage import StorageContext
-from llama_index.core.indices.keyword_table import SimpleKeywordTableIndex
+import math
+import numpy as np
+from collections import Counter
+import concurrent.futures
 
 # ================================================================
-# НАСТРОЙКА ЛОГГЕРА (ДО ВСЕХ ИМПОРТОВ)
+# НАСТРОЙКА ЛОГГЕРА
 # ================================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -36,7 +38,6 @@ from llama_index.core import (
     Settings,
     Document,
     VectorStoreIndex,
-    SimpleKeywordTableIndex,
 )
 from llama_index.core.storage.docstore import SimpleDocumentStore
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
@@ -46,39 +47,54 @@ from llama_index.core.response_synthesizers import TreeSummarize
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.retrievers import VectorIndexRetriever
-from llama_index.core.retrievers import KeywordTableSimpleRetriever
 from llama_index.core.prompts import PromptTemplate
-from llama_index.core.retrievers import BaseRetriever
+from llama_index.core.schema import NodeWithScore, TextNode
 
 # ================================================================
-# ОПЦИОНАЛЬНО: ГРАФОВЫЙ ИНДЕКС (ЕСЛИ УСТАНОВЛЕН)
+# ИМПОРТ НАШЕГО ПАРСЕРА И КОНФИГА
 # ================================================================
+from src.document_parser import DocumentParser
+from src.config import Config
+
+# Настройка LLM
 try:
-    from llama_index.core import KnowledgeGraphIndex
+    from src.client import llamaindex_llm
+    Settings.llm = llamaindex_llm
+    logger.info("✅ LLM загружена из client.py")
+except ImportError:
+    from llama_index.llms.openai_like import OpenAILike
+    Settings.llm = OpenAILike(
+        api_key=Config.LM_STUDIO_API_KEY,
+        api_base=Config.LM_STUDIO_URL,
+        is_chat_model=True,
+        context_window=8192,
+        temperature=Config.TEMPERATURE_ANALYTICAL,
+        max_tokens=Config.MAX_TOKENS,
+        timeout=120,
+    )
+    logger.info("✅ LLM создана из конфига")
+
+# ================================================================
+# ПРОВЕРКА ДОСТУПНОСТИ ГРАФА
+# ================================================================
+GRAPH_AVAILABLE = False
+try:
     from llama_index.graph_stores.neo4j import Neo4jGraphStore
     GRAPH_AVAILABLE = True
-    logger.info("✅ Графовый индекс доступен")
+    logger.info("✅ Графовый индекс доступен (Neo4j)")
 except ImportError as e:
-    GRAPH_AVAILABLE = False
     logger.warning(f"⚠️ Графовый индекс НЕ ДОСТУПЕН: {e}")
-
-from src.client import llamaindex_llm
-from src.config import Config
-from src.document_parser import document_parser
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+    GRAPH_AVAILABLE = False
 
 # ================================================================
 # НАСТРОЙКИ
 # ================================================================
-Settings.llm = llamaindex_llm
 
 # Загрузка модели эмбеддингов
 try:
     logger.info(f"🔄 Загрузка модели эмбеддингов: {Config.EMBEDDING_MODEL}")
     Settings.embed_model = HuggingFaceEmbedding(
-        model_name=Config.EMBEDDING_MODEL,
+        model_name=str(Config.EMBEDDING_MODEL),
         device=Config.EMBEDDING_DEVICE,
         trust_remote_code=True,
         cache_folder=str(Config.MODELS_DIR / "embeddings"),
@@ -95,98 +111,358 @@ except Exception as e:
 
 Settings.chunk_size = Config.CHUNK_SIZE
 Settings.chunk_overlap = Config.CHUNK_OVERLAP
-Settings.node_parser = SentenceSplitter(
+
+# Создаем сплиттер для чанков
+node_parser = SentenceSplitter(
     chunk_size=Config.CHUNK_SIZE,
-    chunk_overlap=Config.CHUNK_OVERLAP
+    chunk_overlap=Config.CHUNK_OVERLAP,
+    paragraph_separator="\n\n",
+    secondary_chunking_regex="[^,.;]+[,.;]?",
 )
 
 # Директории
-DOCSTORE_DIR = Config.DOCSTORE_DIR
-DOCSTORE_DIR.mkdir(parents=True, exist_ok=True)
 CACHE_DIR = Config.CACHE_DIR
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CHUNKS_DIR = Config.CHUNKS_DIR
+DOCSTORE_DIR = Config.DOCSTORE_DIR
+STORAGE_CONTEXT_DIR = Config.STORAGE_CONTEXT_DIR
 
-DOCSTORE_FILE = DOCSTORE_DIR / "docstore.json"
-INDEX_CACHE_FILE = CACHE_DIR / "index_cache.pkl"
-METADATA_CACHE_FILE = CACHE_DIR / "metadata_cache.pkl"
+# Файлы для хранения чанков
+CHUNKS_METADATA_FILE = CHUNKS_DIR / "chunks_metadata.json"
+CHUNKS_INDEX_FILE = CHUNKS_DIR / "chunks_index.pkl"
 
 SEARCH_K = Config.SEARCH_K
 logger.info(f"🔍 SEARCH_K = {SEARCH_K}")
 
 
-class MergedRetriever(BaseRetriever):
-    """Объединяет результаты нескольких ретриверов"""
+# ================================================================
+# КЛАСС ChunkManager
+# ================================================================
+
+class ChunkManager:
+    """Управление чанками документов"""
     
-    def __init__(self, retrievers, similarity_top_k=5):
-        self.retrievers = retrievers
-        self.similarity_top_k = similarity_top_k
-        super().__init__()
-    
-    def _retrieve(self, query_bundle):
-        all_nodes = []
-        seen_ids = set()
+    def __init__(self, chunks_dir: Path = None):
+        self.chunks_dir = chunks_dir or CHUNKS_DIR
+        self.chunks_dir.mkdir(parents=True, exist_ok=True)
         
-        for retriever in self.retrievers:
+        self.chunks_metadata_file = self.chunks_dir / "chunks_metadata.json"
+        self.chunks_index_file = self.chunks_dir / "chunks_index.pkl"
+        
+        self._chunks_cache: Dict[str, Dict[str, Any]] = {}
+        self._doc_hash: Optional[str] = None
+        
+        self._load_chunks()
+    
+    def _load_chunks(self):
+        if self.chunks_metadata_file.exists():
             try:
-                nodes = retriever._retrieve(query_bundle)
-                for node in nodes:
-                    node_id = node.node.node_id
-                    if node_id not in seen_ids:
-                        seen_ids.add(node_id)
-                        all_nodes.append(node)
+                with open(self.chunks_metadata_file, 'r', encoding='utf-8') as f:
+                    self._chunks_cache = json.load(f)
+                logger.info(f"📦 Загружено {len(self._chunks_cache)} чанков из кэша")
             except Exception as e:
-                logger.warning(f"⚠️ Ошибка ретривера: {e}")
-                continue
+                logger.warning(f"⚠️ Ошибка загрузки метаданных чанков: {e}")
+                self._chunks_cache = {}
         
-        all_nodes.sort(key=lambda x: x.score if x.score is not None else 0, reverse=True)
-        return all_nodes[:self.similarity_top_k]
-
-
-class GraphRetriever(BaseRetriever):
-    """Расширенный ретривер с использованием Neo4j графа"""
+        if self.chunks_index_file.exists():
+            try:
+                with open(self.chunks_index_file, 'rb') as f:
+                    index_data = pickle.load(f)
+                    self._doc_hash = index_data.get('doc_hash')
+                    logger.info(f"📦 Загружен хеш документов: {self._doc_hash[:12] if self._doc_hash else 'None'}")
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка загрузки индекса чанков: {e}")
+                self._doc_hash = None
     
-    def __init__(self, graph_store, graph_index, similarity_top_k=5):
-        self.graph_store = graph_store
-        self.graph_index = graph_index
+    def _save_chunks(self):
+        try:
+            with open(self.chunks_metadata_file, 'w', encoding='utf-8') as f:
+                json.dump(self._chunks_cache, f, ensure_ascii=False, indent=2)
+            
+            with open(self.chunks_index_file, 'wb') as f:
+                pickle.dump({
+                    'doc_hash': self._doc_hash,
+                    'chunk_count': len(self._chunks_cache),
+                    'timestamp': datetime.now().isoformat()
+                }, f)
+            
+            logger.info(f"💾 Сохранено {len(self._chunks_cache)} чанков в кэш")
+        except Exception as e:
+            logger.error(f"❌ Ошибка сохранения чанков: {e}")
+    
+    def get_doc_hash(self) -> Optional[str]:
+        return self._doc_hash
+    
+    def set_doc_hash(self, doc_hash: str):
+        self._doc_hash = doc_hash
+        self._save_chunks()
+    
+    def has_chunks(self) -> bool:
+        return len(self._chunks_cache) > 0
+    
+    def get_all_chunks(self) -> List[Dict[str, Any]]:
+        return list(self._chunks_cache.values())
+    
+    def get_chunks_by_document(self, doc_name: str) -> List[Dict[str, Any]]:
+        return [
+            chunk for chunk in self._chunks_cache.values()
+            if chunk.get('metadata', {}).get('source') == doc_name
+        ]
+    
+    def get_chunks_by_page(self, page_num: int) -> List[Dict[str, Any]]:
+        return [
+            chunk for chunk in self._chunks_cache.values()
+            if chunk.get('metadata', {}).get('page') == page_num
+        ]
+    
+    def get_available_pages(self) -> List[int]:
+        pages = set()
+        for chunk in self._chunks_cache.values():
+            page = chunk.get('metadata', {}).get('page')
+            if page is not None:
+                pages.add(page)
+        return sorted(list(pages))
+    
+    def save_chunks_from_documents(self, documents: List[Document]) -> List[Dict[str, Any]]:
+        logger.info(f"📝 Создание чанков из {len(documents)} документов...")
+        
+        all_chunks = []
+        
+        for doc_idx, doc in enumerate(documents):
+            doc_metadata = doc.metadata if hasattr(doc, 'metadata') else {}
+            source = doc_metadata.get('source', f'doc_{doc_idx}')
+            page = doc_metadata.get('page', 1)
+            doc_type = doc_metadata.get('type', 'unknown')
+            
+            chunks = node_parser.split_text(doc.text)
+            
+            logger.info(f"  📄 {source} (стр. {page}): {len(chunks)} чанков")
+            
+            for chunk_idx, chunk_text in enumerate(chunks):
+                if not chunk_text.strip():
+                    continue
+                
+                chunk_id = f"{source}_p{page}_c{chunk_idx}"
+                
+                chunk_data = {
+                    'id': chunk_id,
+                    'text': chunk_text,
+                    'metadata': {
+                        'source': source,
+                        'page': page,
+                        'chunk_index': chunk_idx,
+                        'total_chunks': len(chunks),
+                        'document_type': doc_type,
+                        'has_ocr': doc_metadata.get('has_ocr', False),
+                        'has_tables': doc_metadata.get('has_tables', False),
+                    },
+                    'created_at': datetime.now().isoformat(),
+                    'text_length': len(chunk_text),
+                }
+                
+                self._chunks_cache[chunk_id] = chunk_data
+                all_chunks.append(chunk_data)
+        
+        self._save_chunks()
+        logger.info(f"✅ Создано {len(all_chunks)} чанков")
+        
+        return all_chunks
+    
+    def get_chunks_for_indexing(self) -> List[Document]:
+        documents = []
+        
+        for chunk_id, chunk_data in self._chunks_cache.items():
+            doc = Document(
+                text=chunk_data['text'],
+                metadata={
+                    'chunk_id': chunk_id,
+                    'source': chunk_data['metadata']['source'],
+                    'page': chunk_data['metadata']['page'],
+                    'chunk_index': chunk_data['metadata']['chunk_index'],
+                    'total_chunks': chunk_data['metadata']['total_chunks'],
+                    'document_type': chunk_data['metadata']['document_type'],
+                }
+            )
+            documents.append(doc)
+        
+        logger.info(f"📚 Подготовлено {len(documents)} чанков для индексации")
+        return documents
+    
+    def clear(self):
+        self._chunks_cache = {}
+        self._doc_hash = None
+        self._save_chunks()
+        logger.info("🧹 Кэш чанков очищен")
+
+
+# ================================================================
+# КЛАСС BM25Retriever
+# ================================================================
+
+class BM25Retriever:
+    """BM25 ретривер для keyword поиска"""
+    
+    def __init__(self, nodes, similarity_top_k: int = 5, b: float = 0.75, k1: float = 1.2):
+        self.nodes = nodes
         self.similarity_top_k = similarity_top_k
-        super().__init__()
+        self.b = b
+        self.k1 = k1
+        
+        self._build_index()
     
-    def _retrieve(self, query_bundle):
-        """Извлекает узлы из графа на основе запроса"""
-        query_text = query_bundle.query_str
+    def _build_index(self):
+        """Построение BM25 индекса"""
+        self.node_texts = [node.text.lower() for node in self.nodes]
+        self.node_ids = [node.node_id for node in self.nodes]
+        
+        # Документы
+        self.doc_lengths = [len(text.split()) for text in self.node_texts]
+        self.avg_doc_len = sum(self.doc_lengths) / len(self.doc_lengths) if self.doc_lengths else 0
+        
+        # Строим инвертированный индекс
+        self.inverted_index = {}
+        self.doc_freq = Counter()
+        
+        stop_words = {'это', 'для', 'без', 'на', 'в', 'с', 'по', 'к', 'у', 'о', 'и', 'а', 'но', 'или', 'так', 'же',
+                     'что', 'как', 'все', 'его', 'ее', 'их', 'был', 'была', 'было', 'были', 'из', 'от', 'до', 'за',
+                     'при', 'про', 'через', 'над', 'под', 'об', 'от', 'перед', 'между', 'среди', 'вокруг', 'около'}
+        
+        for doc_idx, text in enumerate(self.node_texts):
+            words = re.findall(r'[а-яА-Яa-zA-Z0-9]{3,}', text)
+            words = [w for w in words if w.lower() not in stop_words]
+            
+            word_counts = Counter(words)
+            for word, count in word_counts.items():
+                if word not in self.inverted_index:
+                    self.inverted_index[word] = []
+                self.inverted_index[word].append((doc_idx, count))
+                self.doc_freq[word] += 1
+        
+        self.total_docs = len(self.nodes)
+        self.doc_id_to_node = {i: node for i, node in enumerate(self.nodes)}
+        
+        logger.info(f"✅ BM25 индекс построен: {len(self.inverted_index)} уникальных слов")
+    
+    def retrieve(self, query: str) -> List[NodeWithScore]:
+        """Поиск по BM25"""
+        if not query:
+            return []
+        
+        query_words = re.findall(r'[а-яА-Яa-zA-Z0-9]{3,}', query.lower())
+        
+        stop_words = {'это', 'для', 'без', 'на', 'в', 'с', 'по', 'к', 'у', 'о', 'и', 'а', 'но', 'или', 'так', 'же',
+                     'что', 'как', 'все', 'его', 'ее', 'их', 'был', 'была', 'было', 'были', 'из', 'от', 'до', 'за',
+                     'при', 'про', 'через', 'над', 'под', 'об', 'от', 'перед', 'между', 'среди', 'вокруг', 'около'}
+        query_words = [w for w in query_words if w.lower() not in stop_words]
+        
+        if not query_words:
+            return []
+        
+        # Вычисляем BM25 score для каждого документа
+        scores = np.zeros(self.total_docs)
+        
+        for word in query_words:
+            if word not in self.inverted_index:
+                continue
+            
+            # IDF
+            idf = math.log((self.total_docs - self.doc_freq[word] + 0.5) / (self.doc_freq[word] + 0.5) + 1)
+            
+            for doc_idx, term_freq in self.inverted_index[word]:
+                # TF с нормализацией
+                doc_len = self.doc_lengths[doc_idx]
+                norm_doc_len = doc_len / self.avg_doc_len
+                
+                # BM25 score
+                numerator = term_freq * (self.k1 + 1)
+                denominator = term_freq + self.k1 * (1 - self.b + self.b * norm_doc_len)
+                score = idf * numerator / denominator
+                
+                scores[doc_idx] += score
+        
+        # Сортируем по score
+        top_indices = np.argsort(scores)[::-1][:self.similarity_top_k]
+        
         results = []
+        for doc_idx in top_indices:
+            if scores[doc_idx] > 0:
+                node = self.doc_id_to_node[doc_idx]
+                results.append(NodeWithScore(node=node, score=float(scores[doc_idx])))
+        
+        return results
+
+
+# ================================================================
+# КЛАСС GraphRetriever
+# ================================================================
+
+class GraphRetriever:
+    """Графовый ретривер для Neo4j"""
+    
+    def __init__(self, graph_store, similarity_top_k: int = 5):
+        self.graph_store = graph_store
+        self.similarity_top_k = similarity_top_k
+        self._driver = None
+        logger.info("✅ GraphRetriever инициализирован")
+    
+    def _get_driver(self):
+        """Получение драйвера Neo4j"""
+        if self._driver:
+            return self._driver
+        
+        if hasattr(self.graph_store, 'driver'):
+            self._driver = self.graph_store.driver
+            return self._driver
         
         try:
-            # ============================================================
-            # 1. Извлекаем ключевые сущности из запроса
-            # ============================================================
-            # Ищем названия сущностей (слова с заглавной буквы или в кавычках)
-            entities = re.findall(r'"([^"]+)"|«([^»]+)»|([А-Я][а-я]+(?:[-\s][А-Я][а-я]+)*)', query_text)
+            from neo4j import GraphDatabase
+            from src.config import Config
+            self._driver = GraphDatabase.driver(
+                Config.NEO4J_URI,
+                auth=(Config.NEO4J_USERNAME, Config.NEO4J_PASSWORD)
+            )
+            return self._driver
+        except Exception as e:
+            logger.error(f"❌ Ошибка создания драйвера: {e}")
+            return None
+    
+    def retrieve(self, query: str) -> List[NodeWithScore]:
+        results = []
+        
+        if not query or not isinstance(query, str):
+            return results
+        
+        driver = self._get_driver()
+        if not driver:
+            return results
+        
+        try:
+            entities = re.findall(r'"([^"]+)"|«([^»]+)»|([А-Я][а-я]+(?:[-\s][А-Я][а-я]+)*)', query)
             entities = [e for group in entities for e in group if e]
             
-            # Если ничего не нашли - берем все слова длиннее 3 символов
             if not entities:
-                entities = re.findall(r'\b[А-Яа-яA-Za-z]{4,}\b', query_text)
+                entities = re.findall(r'\b[А-Яа-яA-Za-z]{4,}\b', query)
+            
+            if not entities:
+                return results
             
             logger.info(f"🔍 Граф: найдены сущности: {entities[:3]}")
             
-            # ============================================================
-            # 2. Ищем связи между сущностями в графе
-            # ============================================================
-            for entity in entities[:3]:  # Берем первые 3 сущности
-                # Ищем узлы, содержащие эту сущность
-                cypher = f"""
-                MATCH (n)
-                WHERE toLower(n.name) CONTAINS toLower('{entity}') 
-                   OR toLower(n.text) CONTAINS toLower('{entity}')
-                OPTIONAL MATCH (n)-[r]-(related)
-                RETURN n, collect(DISTINCT related) as related_nodes, 
-                       collect(DISTINCT type(r)) as relations
-                LIMIT 5
-                """
-                
-                try:
-                    with self.graph_store.session as session:
+            with driver.session() as session:
+                for entity in entities[:3]:
+                    if not entity or len(str(entity)) < 2:
+                        continue
+                        
+                    cypher = f"""
+                    MATCH (n)
+                    WHERE toLower(n.text) CONTAINS toLower('{entity}')
+                       OR toLower(n.name) CONTAINS toLower('{entity}')
+                    OPTIONAL MATCH (n)-[r]-(related)
+                    RETURN n, collect(DISTINCT related) as related_nodes, 
+                           collect(DISTINCT type(r)) as relations
+                    LIMIT 5
+                    """
+                    
+                    try:
                         result = session.run(cypher)
                         for record in result:
                             node = record['n']
@@ -194,9 +470,6 @@ class GraphRetriever(BaseRetriever):
                             relations = record['relations']
                             
                             if node:
-                                # Создаем node для совместимости с другими ретриверами
-                                from llama_index.core.schema import NodeWithScore, TextNode
-                                
                                 node_text = node.get('text', node.get('name', str(node)))
                                 if related_nodes:
                                     node_text += f"\n\nСвязанные сущности: {', '.join([str(r) for r in related_nodes[:5]])}"
@@ -213,76 +486,197 @@ class GraphRetriever(BaseRetriever):
                                     }
                                 )
                                 
-                                results.append(NodeWithScore(
-                                    node=text_node,
-                                    score=0.85  # Высокий приоритет для графовых результатов
-                                ))
+                                results.append(NodeWithScore(node=text_node, score=0.85))
                                 
-                                logger.info(f"   ✅ Найден узел в графе: {node.get('name', node.get('text', ''))[:50]}...")
-                                
-                except Exception as e:
-                    logger.warning(f"⚠️ Ошибка графового запроса для {entity}: {e}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Ошибка графового запроса для {entity}: {e}")
             
-            # ============================================================
-            # 3. Ищем связи по типу (если запрос содержит "связи", "отношения" и т.д.)
-            # ============================================================
-            if any(word in query_text.lower() for word in ['связ', 'отнош', 'связан', 'граф']):
-                logger.info("🔍 Граф: поиск связей по запросу...")
-                cypher = f"""
-                MATCH (n)-[r]-(m)
-                WHERE toLower(n.name) CONTAINS toLower('{entities[0] if entities else "товар"}')
-                   OR toLower(m.name) CONTAINS toLower('{entities[0] if entities else "товар"}')
-                RETURN n, r, m
-                LIMIT 10
-                """
-                
-                try:
-                    with self.graph_store.session as session:
-                        result = session.run(cypher)
-                        for record in result:
-                            n = record['n']
-                            r = record['r']
-                            m = record['m']
-                            
-                            if n and m and r:
-                                rel_text = f"{n.get('name', n.get('text', ''))} --[{type(r)}]--> {m.get('name', m.get('text', ''))}"
-                                
-                                from llama_index.core.schema import NodeWithScore, TextNode
-                                text_node = TextNode(
-                                    text=rel_text,
-                                    metadata={
-                                        'source': 'graph_relation',
-                                        'relation_type': type(r),
-                                        'from': n.get('name', ''),
-                                        'to': m.get('name', '')
-                                    }
-                                )
-                                
-                                results.append(NodeWithScore(
-                                    node=text_node,
-                                    score=0.9  # Очень высокий приоритет для связей
-                                ))
-                except Exception as e:
-                    logger.warning(f"⚠️ Ошибка поиска связей: {e}")
-                    
         except Exception as e:
             logger.error(f"❌ Ошибка графового ретривера: {e}")
         
-        # Сортируем по score и возвращаем
         results.sort(key=lambda x: x.score if x.score is not None else 0, reverse=True)
         return results[:self.similarity_top_k]
 
 
+# ================================================================
+# КЛАСС ImprovedHybridRetriever
+# ================================================================
+
+class ImprovedHybridRetriever:
+    """
+    Улучшенный гибридный ретривер с параллельным запуском
+    """
+    
+    def __init__(self, vector_retriever, keyword_retriever=None, bm25_retriever=None, 
+                 graph_retriever=None, top_k=5):
+        self.vector_retriever = vector_retriever
+        self.keyword_retriever = None  # Отключаем TF-IDF
+        self.bm25_retriever = bm25_retriever
+        self.graph_retriever = graph_retriever
+        self.top_k = top_k
+        
+        # Веса для разных методов
+        self.weights = {
+            'vector': 1.0,
+            'bm25': 0.9,
+            'graph': 0.7
+        }
+        
+        self.score_threshold = 0.1
+        self.use_rrf = True
+        self.rrf_k = 60
+        self.timeout_seconds = 30
+        
+        logger.info(f"✅ ImprovedHybridRetriever создан (параллельный режим)")
+    
+    def retrieve(self, query: str) -> List[NodeWithScore]:
+        """Гибридный поиск с параллельным запуском"""
+        method_results = {}
+        all_results = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures = {}
+            
+            futures['vector'] = executor.submit(self._get_vector_results, query)
+            
+            if self.bm25_retriever:
+                futures['bm25'] = executor.submit(self.bm25_retriever.retrieve, query)
+            
+            if self.graph_retriever:
+                futures['graph'] = executor.submit(self.graph_retriever.retrieve, query)
+            
+            for name, future in futures.items():
+                try:
+                    results = future.result(timeout=self.timeout_seconds)
+                    if results:
+                        method_results[name] = results
+                        all_results.extend(results)
+                        logger.info(f"📊 {name.capitalize()}: {len(results)} результатов")
+                except concurrent.futures.TimeoutError:
+                    logger.warning(f"⚠️ Таймаут {name} поиска (> {self.timeout_seconds} сек)")
+                except Exception as e:
+                    logger.warning(f"⚠️ Ошибка {name} поиска: {e}")
+        
+        if not all_results:
+            logger.warning("⚠️ Нет результатов от всех методов")
+            return []
+        
+        if self.use_rrf and len(method_results) > 1:
+            combined = self._reciprocal_rank_fusion(method_results)
+        else:
+            combined = self._score_fusion(all_results)
+        
+        combined = [r for r in combined if r.score and r.score >= self.score_threshold]
+        top_results = combined[:self.top_k]
+        
+        for node in top_results:
+            if hasattr(node, 'node') and hasattr(node.node, 'metadata'):
+                if isinstance(node.node.metadata, dict):
+                    if 'retriever_source' not in node.node.metadata:
+                        source_guess = self._guess_source(node, method_results)
+                        node.node.metadata['retriever_source'] = source_guess
+        
+        logger.info(f"✅ Объединено {len(top_results)} результатов из {len(all_results)} (использовано {len(method_results)} методов)")
+        
+        return top_results
+    
+    def _get_vector_results(self, query: str) -> List[NodeWithScore]:
+        try:
+            results = self.vector_retriever.retrieve(query)
+            if results:
+                max_score = max(r.score for r in results if r.score is not None)
+                min_score = min(r.score for r in results if r.score is not None)
+                if max_score > min_score:
+                    for r in results:
+                        if r.score is not None:
+                            r.score = (r.score - min_score) / (max_score - min_score) * self.weights['vector']
+            return results
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка векторного поиска: {e}")
+            return []
+    
+    def _reciprocal_rank_fusion(self, method_results: Dict[str, List[NodeWithScore]]) -> List[NodeWithScore]:
+        all_nodes = {}
+        node_methods = {}
+        
+        for method, results in method_results.items():
+            for rank, result in enumerate(results, 1):
+                node_id = result.node.node_id
+                if node_id not in all_nodes:
+                    all_nodes[node_id] = result.node
+                    node_methods[node_id] = {}
+                node_methods[node_id][method] = rank
+        
+        final_scores = {}
+        for node_id, methods in node_methods.items():
+            rrf_score = 0.0
+            for method, rank in methods.items():
+                weight = self.weights.get(method, 0.5)
+                rrf_score += weight / (self.rrf_k + rank)
+            final_scores[node_id] = rrf_score
+        
+        sorted_nodes = sorted(
+            [NodeWithScore(node=all_nodes[node_id], score=score) 
+             for node_id, score in final_scores.items()],
+            key=lambda x: x.score if x.score is not None else 0,
+            reverse=True
+        )
+        
+        return sorted_nodes
+    
+    def _score_fusion(self, results: List[NodeWithScore]) -> List[NodeWithScore]:
+        grouped = {}
+        for result in results:
+            node_id = result.node.node_id
+            if node_id not in grouped:
+                grouped[node_id] = {
+                    'node': result.node,
+                    'scores': [],
+                }
+            if result.score is not None:
+                grouped[node_id]['scores'].append(result.score)
+        
+        final_results = []
+        for node_id, data in grouped.items():
+            if data['scores']:
+                avg_score = sum(data['scores']) / len(data['scores'])
+                final_results.append(NodeWithScore(node=data['node'], score=avg_score))
+        
+        final_results.sort(key=lambda x: x.score if x.score is not None else 0, reverse=True)
+        return final_results
+    
+    def _guess_source(self, node: NodeWithScore, method_results: Dict[str, List[NodeWithScore]]) -> str:
+        node_id = node.node.node_id
+        for method, results in method_results.items():
+            for r in results:
+                if r.node.node_id == node_id:
+                    return method
+        return 'unknown'
+    
+    def set_weights(self, vector: float = None, bm25: float = None, graph: float = None):
+        if vector is not None:
+            self.weights['vector'] = vector
+        if bm25 is not None:
+            self.weights['bm25'] = bm25
+        if graph is not None:
+            self.weights['graph'] = graph
+        logger.info(f"⚖️ Веса обновлены: {self.weights}")
+
+
+# ================================================================
+# КЛАСС HybridRAG
+# ================================================================
+
 class HybridRAG:
-    """Гибридный RAG с DocStore для хранения текстов и графовым поиском"""
+    """Гибридный RAG с Vector + BM25 + Graph поиском"""
     
     def __init__(self):
         self.storage_context = None
-        self.persist_dir = CACHE_DIR / "storage_context"
-
-        # ============================================================
+        self.persist_dir = STORAGE_CONTEXT_DIR
+        self.chunk_manager = ChunkManager()
+        self.is_initialized = False
+        
         # QDRANT
-        # ============================================================
         logger.info("🔄 Подключение к Qdrant...")
         try:
             self.qdrant_client = QdrantClient(url=Config.QDRANT_URL)
@@ -295,15 +689,9 @@ class HybridRAG:
             logger.error(f"❌ Ошибка подключения к Qdrant: {e}")
             raise
         
-        # ============================================================
-        # DOCSTORE (ХРАНИЛИЩЕ ТЕКСТОВ)
-        # ============================================================
-        self.docstore = SimpleDocumentStore()
-        
-        # ============================================================
-        # NEO4J (ОПЦИОНАЛЬНО)
-        # ============================================================
+        # NEO4J
         self.graph_store = None
+        self.graph_retriever = None
         self.use_graph = False
         
         if GRAPH_AVAILABLE:
@@ -311,30 +699,40 @@ class HybridRAG:
                 self.graph_store = Neo4jGraphStore(
                     username=Config.NEO4J_USERNAME,
                     password=Config.NEO4J_PASSWORD,
-                    url=Config.NEO4J_URI
+                    url=Config.NEO4J_URI,
+                    database="neo4j"
                 )
-                logger.info("✅ Подключение к Neo4j установлено")
+                self.graph_retriever = GraphRetriever(
+                    graph_store=self.graph_store,
+                    similarity_top_k=SEARCH_K
+                )
                 self.use_graph = True
+                logger.info("✅ Подключение к Neo4j установлено")
             except Exception as e:
                 logger.warning(f"⚠️ Neo4j не доступен: {e}")
                 self.graph_store = None
+                self.graph_retriever = None
                 self.use_graph = False
-        else:
-            logger.info("ℹ️ Графовый индекс отключен (зависимости не установлены)")
         
-        # ============================================================
+        # DOCSTORE
+        self.docstore = SimpleDocumentStore()
+        self.docstore_file = DOCSTORE_DIR / "docstore.json"
+        
         # ИНДЕКСЫ
-        # ============================================================
         self.vector_index = None
-        self.keyword_index = None
-        self.graph_index = None
         self.query_engine = None
-        self.is_initialized = False
+        self.hybrid_retriever = None
         self.documents_dir = Config.DOCUMENTS_DIR
+        self._nodes_cache = None
         
-        # ============================================================
+        # ПАРСЕР
+        self.parser = DocumentParser(
+            use_ocr=Config.USE_OCR,
+            ocr_lang=Config.OCR_LANGUAGE,
+            cache_dir=Config.PARSED_DOCS_DIR
+        )
+        
         # РЕ-РАНКЕР
-        # ============================================================
         logger.info("🔄 Загрузка ре-ранкера...")
         try:
             self.reranker = SentenceTransformerRerank(
@@ -347,10 +745,13 @@ class HybridRAG:
             logger.warning(f"⚠️ Ре-ранкер не загружен: {e}")
             self.reranker = None
 
+    # ============================================================
+    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ
+    # ============================================================
+    
     def _get_documents_hash(self) -> str:
-        """Вычисляет хеш документов"""
         hasher = hashlib.md5()
-        extensions = getattr(Config, 'SUPPORTED_EXTENSIONS', ['.pdf', '.docx', '.doc', '.txt', '.md'])
+        extensions = Config.SUPPORTED_EXTENSIONS
         for ext in extensions:
             for file_path in self.documents_dir.glob(f'*{ext}'):
                 if file_path.is_file():
@@ -358,9 +759,8 @@ class HybridRAG:
                     hasher.update(str(file_path.stat().st_mtime).encode())
                     hasher.update(str(file_path.stat().st_size).encode())
         return hasher.hexdigest()
-
+    
     def _check_qdrant(self) -> bool:
-        """Проверяет данные в Qdrant"""
         try:
             collections = self.qdrant_client.get_collections().collections
             exists = any(c.name == Config.QDRANT_COLLECTION for c in collections)
@@ -372,110 +772,73 @@ class HybridRAG:
         except Exception as e:
             logger.error(f"Ошибка Qdrant: {e}")
             return False
-
+    
     def _load_docstore(self) -> bool:
-        """Загружает docstore из файла"""
-        if not DOCSTORE_FILE.exists():
+        if not self.docstore_file.exists():
             logger.info("📁 Docstore не найден")
             return False
         
         try:
-            self.docstore = SimpleDocumentStore.from_persist_path(str(DOCSTORE_FILE))
-            logger.info(f"✅ Docstore загружен из {DOCSTORE_FILE}")
-            
-            docs = list(self.docstore.docs.values())
-            logger.info(f"📄 В docstore {len(docs)} документов")
-            
-            if docs:
-                sample = docs[0]
-                text_preview = sample.text[:100] if sample.text else "ПУСТО"
-                logger.info(f"   Пример: {text_preview}...")
-            
+            self.docstore = SimpleDocumentStore.from_persist_path(str(self.docstore_file))
+            logger.info(f"✅ Docstore загружен из {self.docstore_file}")
+            self._nodes_cache = list(self.docstore.docs.values())
             return True
         except Exception as e:
-            logger.error(f"❌ Ошибка загрузки docstore: {e}", exc_info=True)
+            logger.error(f"❌ Ошибка загрузки docstore: {e}")
             return False
-
+    
     def _save_docstore(self):
-        """Сохраняет docstore"""
         try:
-            DOCSTORE_FILE.parent.mkdir(parents=True, exist_ok=True)
-            self.docstore.persist(str(DOCSTORE_FILE))
-            
-            file_size = DOCSTORE_FILE.stat().st_size if DOCSTORE_FILE.exists() else 0
-            logger.info(f"💾 Docstore сохранен: {DOCSTORE_FILE} ({file_size} байт)")
-            
-            docs = list(self.docstore.docs.values())
-            logger.info(f"📄 Сохранено {len(docs)} документов")
+            self.docstore_file.parent.mkdir(parents=True, exist_ok=True)
+            self.docstore.persist(str(self.docstore_file))
+            logger.info(f"💾 Docstore сохранен: {self.docstore_file}")
+            self._nodes_cache = list(self.docstore.docs.values())
         except Exception as e:
-            logger.error(f"❌ Ошибка сохранения docstore: {e}", exc_info=True)
-
+            logger.error(f"❌ Ошибка сохранения docstore: {e}")
+    
     def _parse_all_documents(self) -> List[Document]:
-        """Парсит все документы с сохранением информации о страницах"""
-        logger.info("📚 Обработка документов через document_parser...")
-        
+        logger.info("📚 Обработка документов через парсер...")
         documents = []
-        parsed_docs = document_parser.parse_all_documents(self.documents_dir)
         
-        if not parsed_docs:
-            logger.warning("⚠️ Нет документов для индексации")
-            return documents
-        
-        for doc_data in parsed_docs:
-            full_text = doc_data.get('text', '')
-            
-            if not full_text.strip():
-                logger.warning(f"⚠️ Пропускаем пустой документ: {doc_data['metadata']['source']}")
-                continue
-            
-            # ============================================================
-            # ИЗВЛЕКАЕМ ИНФОРМАЦИЮ О СТРАНИЦАХ
-            # ============================================================
-            import re
-            
-            # Ищем все маркеры страниц: [Страница X]
-            page_pattern = r'\[Страница (\d+)\]\n(.*?)(?=\[Страница \d+\]|$)'
-            matches = re.findall(page_pattern, full_text, re.DOTALL)
-            
-            page_map = {}
-            if matches:
-                for page_num, page_text in matches:
-                    page_map[int(page_num)] = page_text.strip()
-                logger.info(f"  📄 Найдено страниц: {len(page_map)}")
-            else:
-                page_map[1] = full_text
-            
-            # ============================================================
-            # СОЗДАЕМ ДОКУМЕНТЫ ПО СТРАНИЦАМ (вместо одного большого)
-            # ============================================================
-            for page_num, page_text in page_map.items():
-                if not page_text.strip():
+        for ext in Config.SUPPORTED_EXTENSIONS:
+            for file_path in self.documents_dir.glob(f'*{ext}'):
+                if not file_path.is_file() or file_path.name == '.gitkeep':
                     continue
                 
-                # Добавляем номер страницы в начало текста и в метаданные
-                page_text_with_marker = f"[Страница {page_num}]\n{page_text}"
+                logger.info(f"  📄 Парсинг: {file_path.name}")
+                parsed_data = self.parser.parse_document(file_path)
                 
-                document = Document(
-                    text=page_text_with_marker,
-                    metadata={
-                        'source': doc_data['metadata'].get('source', 'unknown'),
-                        'type': doc_data['metadata'].get('type', 'unknown'),
-                        'page': page_num,  # ← ЯВНЫЙ НОМЕР СТРАНИЦЫ
-                        'total_pages': len(page_map),
-                        'has_ocr': bool(doc_data.get('ocr_text')),
-                        'ocr_method': doc_data.get('ocr_method'),
-                        'has_tables': bool(doc_data.get('tables')),
-                    }
-                )
-                documents.append(document)
-            
-            logger.info(f"  ✅ Добавлен: {doc_data['metadata']['source']} ({len(page_map)} страниц)")
+                if not parsed_data.get('pages'):
+                    logger.warning(f"  ⚠️ Нет страниц в {file_path.name}")
+                    continue
+                
+                for page_data in parsed_data['pages']:
+                    page_num = page_data.get('page_num', 1)
+                    page_text = page_data.get('text', '')
+                    
+                    if not page_text.strip():
+                        continue
+                    
+                    doc = Document(
+                        text=page_text,
+                        metadata={
+                            'source': file_path.name,
+                            'page': page_num,
+                            'total_pages': parsed_data.get('metadata', {}).get('total_pages', 1),
+                            'has_ocr': 'ocr_text' in page_data,
+                            'has_tables': page_data.get('has_tables', False),
+                            'has_images': page_data.get('has_images', False),
+                            'page_type': page_data.get('type', 'text'),
+                        }
+                    )
+                    documents.append(doc)
+                
+                logger.info(f"  ✅ {file_path.name}: {len(parsed_data['pages'])} страниц")
         
         logger.info(f"📚 Всего загружено документов: {len(documents)}")
         return documents
-
+    
     def _create_collection(self):
-        """Создает коллекцию в Qdrant"""
         try:
             if not self.qdrant_client.collection_exists(Config.QDRANT_COLLECTION):
                 logger.info(f"🛠️ Создание коллекции...")
@@ -492,260 +855,212 @@ class HybridRAG:
         except Exception as e:
             logger.error(f"❌ Ошибка создания коллекции: {e}")
             raise
-
+    
     def _load_from_cache(self) -> bool:
-        """Загружает только векторный индекс (без keyword и graph)"""
-        if not INDEX_CACHE_FILE.exists() or not METADATA_CACHE_FILE.exists():
+        current_hash = self._get_documents_hash()
+        cached_hash = self.chunk_manager.get_doc_hash()
+        
+        if cached_hash != current_hash:
+            logger.info(f"🔄 Хеш изменился: {cached_hash[:12] if cached_hash else 'None'} -> {current_hash[:12]}")
             return False
         
-        try:
-            with open(METADATA_CACHE_FILE, 'rb') as f:
-                cached = pickle.load(f)
-            
-            if cached.get('hash') != self._get_documents_hash():
-                return False
-            
-            if not self._check_qdrant():
-                return False
-            
-            if not self._load_docstore():
-                return False
-            
-            # Загружаем StorageContext
-            from llama_index.core.storage import StorageContext
-            self.persist_dir = CACHE_DIR / "storage_context"
-            
-            if self.persist_dir.exists():
+        if not self.chunk_manager.has_chunks():
+            logger.info("📁 Нет чанков в кэше")
+            return False
+        
+        if not self._check_qdrant():
+            logger.info("📁 Нет данных в Qdrant")
+            return False
+        
+        if not self._load_docstore():
+            return False
+        
+        if self.persist_dir.exists():
+            try:
                 self.storage_context = StorageContext.from_defaults(
                     vector_store=self.vector_store,
                     docstore=self.docstore,
                     persist_dir=str(self.persist_dir)
                 )
-            else:
-                self.storage_context = StorageContext.from_defaults(
-                    vector_store=self.vector_store,
-                    docstore=self.docstore
-                )
-            
-            # Восстанавливаем только векторный индекс
+                logger.info(f"✅ StorageContext восстановлен из {self.persist_dir}")
+            except Exception as e:
+                logger.warning(f"⚠️ Ошибка восстановления StorageContext: {e}")
+                return False
+        else:
+            self.storage_context = StorageContext.from_defaults(
+                vector_store=self.vector_store,
+                docstore=self.docstore
+            )
+        
+        try:
             self.vector_index = VectorStoreIndex.from_vector_store(
                 vector_store=self.vector_store,
                 embed_model=Settings.embed_model,
                 storage_context=self.storage_context
             )
             logger.info("✅ Векторный индекс восстановлен")
-            
-            # Keyword и Graph отключаем (из-за ошибки совместимости)
-            self.keyword_index = None
-            self.graph_index = None
-            logger.info("ℹ️ Keyword и Graph индексы отключены (используется только векторный поиск)")
-            
-            self._setup_query_engine()
-            self.is_initialized = True
-            logger.info("✅ Система готова")
-            return True
-            
         except Exception as e:
-            logger.error(f"❌ Ошибка: {e}")
+            logger.error(f"❌ Ошибка восстановления индекса: {e}")
             return False
-
+        
+        self._setup_query_engine()
+        self.is_initialized = True
+        logger.info("✅ Система готова (из кэша)")
+        return True
+    
     def _save_to_cache(self):
-        """Сохраняет индексы через storage_context"""
-        try:
-            self._save_docstore()
-            
-            # Сохраняем storage_context
-            if self.storage_context is not None:
+        self._save_docstore()
+        
+        if self.storage_context is not None:
+            try:
                 self.persist_dir.mkdir(parents=True, exist_ok=True)
                 self.storage_context.persist(persist_dir=str(self.persist_dir))
                 logger.info(f"✅ StorageContext сохранен в {self.persist_dir}")
-            
-            metadata = {
-                'hash': self._get_documents_hash(),
-                'timestamp': datetime.now().isoformat(),
-                'collection': Config.QDRANT_COLLECTION,
-                'embedding_model': Config.EMBEDDING_MODEL,
-                'use_graph': self.use_graph,
-                'documents_count': len(list(self.docstore.docs.values()))
-            }
-            
-            with open(METADATA_CACHE_FILE, 'wb') as f:
-                pickle.dump(metadata, f)
-            
-            with open(INDEX_CACHE_FILE, 'wb') as f:
-                pickle.dump({'type': 'HybridRAG', 'version': '2.0'}, f)
-            
-            logger.info(f"💾 Кэш сохранен")
-        except Exception as e:
-            logger.error(f"❌ Ошибка: {e}")
-
-    def initialize_and_index(self, force_reindex: bool = False):
-        """Инициализация и индексация"""
-        logger.info("🚀 Запуск инициализации...")
-        
-        if not force_reindex and self._load_from_cache():
-            self.is_initialized = True
-            logger.info("✅ Система готова (из кэша)")
-            return
-        
-        logger.info("🔄 Полная переиндексация...")
-        documents = self._parse_all_documents()
-        
-        if not documents:
-            logger.warning("⚠️ Нет документов для индексации")
-            self.is_initialized = False
-            return
-        
-        # Создаем коллекцию в Qdrant
-        self._create_collection()
-        
-        # ============================================================
-        # СОЗДАЕМ STORAGE_CONTEXT ДЛЯ ВСЕХ ИНДЕКСОВ
-        # ============================================================
-        from llama_index.core.storage import StorageContext
-        
-        self.storage_context = StorageContext.from_defaults(
-            vector_store=self.vector_store,
-            docstore=self.docstore,
-            graph_store=self.graph_store if self.use_graph else None
-        )
-        
-        # Создаем векторный индекс
-        logger.info("🧠 Создание векторного индекса (Qdrant)...")
-        self.vector_index = VectorStoreIndex.from_documents(
-            documents,
-            storage_context=self.storage_context,
-            embed_model=Settings.embed_model,
-            show_progress=True
-        )
-        logger.info("✅ Векторный индекс создан")
-        
-        # Создаем keyword индекс
-        try:
-            logger.info("🧠 Создание keyword индекса...")
-            from llama_index.core.indices.keyword_table import SimpleKeywordTableIndex
-            
-            self.keyword_index = SimpleKeywordTableIndex.from_documents(
-                documents,
-                storage_context=self.storage_context,
-                max_keywords_per_chunk=10,
-                show_progress=True
-            )
-            logger.info("✅ Keyword индекс создан")
-        except Exception as e:
-            logger.warning(f"⚠️ Ошибка создания keyword индекса: {e}")
-            self.keyword_index = None
-        
-        # Создаем графовый индекс
-        if self.use_graph and GRAPH_AVAILABLE:
-            try:
-                logger.info("🧠 Создание графового индекса (Neo4j)...")
-                from llama_index.core import KnowledgeGraphIndex
-                
-                self.graph_index = KnowledgeGraphIndex.from_documents(
-                    documents,
-                    storage_context=self.storage_context,
-                    max_triplets_per_chunk=3,
-                    show_progress=True,
-                    include_embeddings=True,
-                    embed_model=Settings.embed_model
-                )
-                logger.info("✅ Графовый индекс создан")
             except Exception as e:
-                logger.warning(f"⚠️ Ошибка создания графового индекса: {e}")
-                self.graph_index = None
-                self.use_graph = False
+                logger.error(f"❌ Ошибка сохранения StorageContext: {e}")
         
-        # Сохраняем кэш
-        self._save_to_cache()
+        current_hash = self._get_documents_hash()
+        self.chunk_manager.set_doc_hash(current_hash)
+    
+    def _get_nodes(self) -> List[Document]:
+        if self._nodes_cache is None:
+            self._nodes_cache = list(self.docstore.docs.values())
+        return self._nodes_cache
+    
+    def _build_graph_index(self, documents: List[Document]):
+        if not self.use_graph or not self.graph_store:
+            logger.warning("⚠️ Граф не доступен, пропускаем построение")
+            return
         
-        # Настраиваем query engine
-        self._setup_query_engine()
-        self.is_initialized = True
-        logger.info("✅ Система готова!")
-
-    def _setup_query_engine(self):
-        """Настройка query engine с расширенным графовым поиском"""
+        logger.info("🏗️ Построение графового индекса...")
+        
+        try:
+            from neo4j import GraphDatabase
+            
+            driver = GraphDatabase.driver(
+                Config.NEO4J_URI,
+                auth=(Config.NEO4J_USERNAME, Config.NEO4J_PASSWORD)
+            )
+            
+            with driver.session() as session:
+                session.run("MATCH (n) DETACH DELETE n")
+                logger.info("🗑️ Граф очищен")
+                
+                count = 0
+                for doc in documents:
+                    try:
+                        text = doc.text
+                        source = doc.metadata.get('source', 'unknown')
+                        page = doc.metadata.get('page', 1)
+                        
+                        doc_id = f"{source}_p{page}"
+                        
+                        check = session.run("MATCH (d:Document {id: $doc_id}) RETURN d", {'doc_id': doc_id})
+                        if check.single():
+                            continue
+                        
+                        session.run("""
+                        CREATE (d:Document {
+                            id: $doc_id,
+                            source: $source,
+                            page: $page,
+                            text: $text
+                        })
+                        """, {
+                            'doc_id': doc_id,
+                            'source': source,
+                            'page': page,
+                            'text': text[:1000]
+                        })
+                        count += 1
+                        
+                        concepts = re.findall(r'([А-ЯЁ][а-яё]+(?:\s+[А-ЯЁ][а-яё]+)*)', text)
+                        concepts = [c for c in concepts if len(c) > 5 and len(c) < 50]
+                        
+                        for concept in set(concepts[:10]):
+                            if not concept.strip():
+                                continue
+                            session.run("MERGE (c:Concept {name: $name})", {'name': concept.strip()})
+                            session.run("""
+                            MATCH (d:Document {id: $doc_id})
+                            MATCH (c:Concept {name: $concept})
+                            CREATE (d)-[:CONTAINS_CONCEPT]->(c)
+                            """, {'doc_id': doc_id, 'concept': concept.strip()})
+                        
+                        if count % 5 == 0:
+                            logger.info(f"   Обработано {count} документов")
+                            
+                    except Exception as e:
+                        logger.warning(f"⚠️ Ошибка обработки документа: {e}")
+                
+                logger.info(f"✅ Создано {count} узлов Document")
+                
+                result = session.run("MATCH (n) RETURN count(n) as total")
+                total = result.single()['total']
+                logger.info(f"📊 Всего узлов в графе: {total}")
+                
+                self._graph_driver = driver
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка построения графа: {e}")
+            self.use_graph = False
+    
+    def _setup_query_engine(self, filters=None):
+        """Настройка гибридного query engine (Vector + BM25 + Graph)"""
         if self.vector_index is None:
             raise ValueError("Индекс не инициализирован")
         
-        logger.info("🔧 Настройка ГИБРИДНОГО поиска с графом...")
+        logger.info("🔧 Настройка ГИБРИДНОГО query engine (Vector + BM25 + Graph)")
         
-        retrievers = []
-        
-        # 1. Векторный ретривер
         vector_retriever = VectorIndexRetriever(
             index=self.vector_index,
-            similarity_top_k=SEARCH_K,
+            similarity_top_k=SEARCH_K * 2,
+            filters=filters,
         )
-        retrievers.append(vector_retriever)
-        logger.info(f"✅ Векторный ретривер (top_k={SEARCH_K})")
+        logger.info("✅ Векторный ретривер создан")
         
-        # 2. Keyword ретривер
-        if self.keyword_index is not None:
+        bm25_retriever = None
+        nodes = self._get_nodes()
+        
+        if nodes:
             try:
-                keyword_retriever = KeywordTableSimpleRetriever(
-                    index=self.keyword_index,
-                    similarity_top_k=SEARCH_K,
+                bm25_retriever = BM25Retriever(
+                    nodes=nodes,
+                    similarity_top_k=SEARCH_K * 2
                 )
-                retrievers.append(keyword_retriever)
-                logger.info(f"✅ Keyword ретривер (top_k={SEARCH_K})")
+                logger.info("✅ BM25 ретривер создан")
             except Exception as e:
-                logger.warning(f"⚠️ Ошибка Keyword ретривера: {e}")
+                logger.warning(f"⚠️ Ошибка создания BM25 ретривера: {e}")
         
-        # 3. Расширенный графовый ретривер
-        if self.use_graph and self.graph_store is not None:
-            try:
-                graph_retriever = GraphRetriever(
-                    graph_store=self.graph_store,
-                    graph_index=self.graph_index,
-                    similarity_top_k=SEARCH_K,
-                )
-                retrievers.append(graph_retriever)
-                logger.info(f"✅ Расширенный графовый ретривер (top_k={SEARCH_K})")
-            except Exception as e:
-                logger.warning(f"⚠️ Ошибка графового ретривера: {e}")
+        self.hybrid_retriever = ImprovedHybridRetriever(
+            vector_retriever=vector_retriever,
+            keyword_retriever=None,
+            bm25_retriever=bm25_retriever,
+            graph_retriever=self.graph_retriever if self.use_graph else None,
+            top_k=SEARCH_K
+        )
+        logger.info("✅ ImprovedHybridRetriever создан (параллельный режим: Vector + BM25 + Graph)")
         
-        # Объединяем ретриверы
-        if len(retrievers) > 1:
-            merged_retriever = MergedRetriever(
-                retrievers=retrievers,
-                similarity_top_k=SEARCH_K,
-            )
-            logger.info(f"✅ Объединенный ретривер ({len(retrievers)} методов)")
-        else:
-            merged_retriever = retrievers[0] if retrievers else None
-            logger.info("ℹ️ Используется только один ретривер")
+        template_str = """
+Ты — корпоративный ассистент компании ООО «Евроторг».
+
+## КОНТЕКСТ:
+{context_str}
+
+## ВОПРОС:
+{query_str}
+
+## ИНСТРУКЦИИ:
+1. Отвечай ТОЛЬКО на основе контекста.
+2. Форматируй ответ так, чтобы он был удобен для чтения.
+3. НЕ добавляй источники в ответ.
+
+## ТВОЙ ОТВЕТ:"""
         
-        # ============================================================
-        # ОБНОВЛЕННЫЙ ПРОМПТ С ИНСТРУКЦИЕЙ ПРО СТРАНИЦЫ
-        # ============================================================
-        template_str = """Ты — ассистент по документации компании ООО «Евроторг».
-
-    Ниже дан КОНТЕКСТ из документов и графа знаний. Ответь на вопрос, используя ТОЛЬКО этот контекст.
-
-    КОНТЕКСТ (включая связи между сущностями):
-    {context_str}
-
-    ВОПРОС: {query_str}
-
-    ИНСТРУКЦИЯ:
-    1. Дай РАЗВЕРНУТЫЙ ответ (2-4 предложения).
-    2. Начни с прямого ответа на вопрос.
-    3. Затем добавь детали из контекста.
-    4. ⚠️ ВАЖНО: Номер страницы УЖЕ указан в контексте в формате [Страница X].
-    - Используй ТОЛЬКО тот номер страницы, который есть в контексте.
-    - НЕ ПРИДУМЫВАЙ номера страниц, которых нет в контексте.
-    - Если в контексте нет номера страницы — не пиши его.
-    5. Если есть связи между сущностями — укажи их.
-    6. НЕ ПИШИ "нет информации", если в контексте есть ответ.
-    7. Ответь на русском языке, вежливо и профессионально.
-
-    ОТВЕТ (развернуто, с указанием источника из контекста):"""
         prompt = PromptTemplate(template_str)
         
         self.query_engine = RetrieverQueryEngine.from_args(
-            retriever=merged_retriever,
+            retriever=self.hybrid_retriever,
             response_synthesizer=TreeSummarize(
                 llm=Settings.llm,
                 summary_template=prompt,
@@ -754,38 +1069,139 @@ class HybridRAG:
             verbose=False,
         )
         
-        logger.info("✅ ГИБРИДНЫЙ ПОИСК с графом настроен!")
-
-    def query_graph(self, cypher_query: str) -> List[Dict]:
-        """Выполняет Cypher-запрос к графу"""
-        if not self.use_graph or not self.graph_store:
-            logger.warning("⚠️ Граф не доступен")
-            return []
+        self.query_engine._is_default = True
+        logger.info("✅ Query engine настроен (Vector + BM25 + Graph, параллельный режим)")
+    
+    # ============================================================
+    # НОВЫЙ МЕТОД: ПАРСИНГ СТРУКТУРИРОВАННОГО ОТВЕТА
+    # ============================================================
+    
+    def _parse_structured_response(self, answer: str, sources: List[Dict]) -> Dict[str, Any]:
+        """Парсит ответ в структурированный JSON"""
+        result = {
+            "title": "",
+            "paragraphs": [],
+            "lists": [],
+            "code_blocks": [],
+            "sources": [],
+            "search_methods": ""
+        }
         
-        try:
-            with self.graph_store.session as session:
-                result = session.run(cypher_query)
-                return [record.data() for record in result]
-        except Exception as e:
-            logger.error(f"❌ Ошибка запроса к графу: {e}")
-            return []
-
-    def find_related_entities(self, entity_name: str, relation_type: str = None) -> List[Dict]:
-        """Находит связанные сущности в графе"""
-        if not self.use_graph:
-            return []
+        lines = answer.split('\n')
+        current_list = None
+        current_code = None
         
-        query = f"""
-        MATCH (e {{name: '{entity_name}'}})
-        OPTIONAL MATCH (e)-[r]-(related)
-        WHERE {relation_type} IS NULL OR type(r) = '{relation_type}'
-        RETURN e, r, related
-        LIMIT 10
-        """
-        return self.query_graph(query)
-
-    def query(self, question: str, verbose: bool = False) -> Dict[str, Any]:
-        """Запрос к системе с получением источников"""
+        for line in lines:
+            line = line.strip()
+            
+            if not line:
+                continue
+            
+            # JSON блок
+            if line.startswith('```json'):
+                current_code = []
+                continue
+            if current_code is not None:
+                if line.startswith('```'):
+                    result["code_blocks"].append({
+                        "language": "json",
+                        "code": '\n'.join(current_code)
+                    })
+                    current_code = None
+                    continue
+                current_code.append(line)
+                continue
+            
+            # Заголовок
+            if line.startswith('###'):
+                result["title"] = line.replace('###', '').strip()
+                continue
+            
+            # Нумерованный список
+            if re.match(r'^\d+\.\s', line):
+                if current_list != 'ol':
+                    current_list = 'ol'
+                    result["lists"].append({"type": "ol", "items": []})
+                item = re.sub(r'^\d+\.\s', '', line)
+                result["lists"][-1]["items"].append(item)
+                continue
+            
+            # Маркированный список
+            if re.match(r'^[-•*]\s', line):
+                if current_list != 'ul':
+                    current_list = 'ul'
+                    result["lists"].append({"type": "ul", "items": []})
+                item = re.sub(r'^[-•*]\s', '', line)
+                result["lists"][-1]["items"].append(item)
+                continue
+            
+            # Обычный текст
+            current_list = None
+            result["paragraphs"].append(line)
+        
+        # Добавляем источники
+        for src in sources:
+            source = src.get('metadata', {}).get('source', '')
+            page = src.get('page', '')
+            if source and page:
+                result["sources"].append(f"{source}, стр. {page}")
+        
+        return result
+        
+    # ============================================================
+    # ПУБЛИЧНЫЕ МЕТОДЫ
+    # ============================================================
+    
+    def initialize_and_index(self, force_reindex: bool = False):
+        logger.info("🚀 Запуск инициализации...")
+        
+        if not force_reindex and self._load_from_cache():
+            logger.info("✅ Система готова (из кэша)")
+            return
+        
+        logger.info("🔄 Полная переиндексация...")
+        
+        documents = self._parse_all_documents()
+        
+        if not documents:
+            logger.warning("⚠️ Нет документов для индексации")
+            self.is_initialized = False
+            return
+        
+        logger.info("📝 Создание чанков...")
+        chunks = self.chunk_manager.save_chunks_from_documents(documents)
+        logger.info(f"✅ Создано {len(chunks)} чанков")
+        
+        chunk_documents = self.chunk_manager.get_chunks_for_indexing()
+        logger.info(f"📚 Подготовлено {len(chunk_documents)} документов для индексации")
+        
+        self._create_collection()
+        
+        self.storage_context = StorageContext.from_defaults(
+            vector_store=self.vector_store,
+            docstore=self.docstore,
+        )
+        
+        logger.info("🧠 Создание векторного индекса (Qdrant)...")
+        self.vector_index = VectorStoreIndex.from_documents(
+            chunk_documents,
+            storage_context=self.storage_context,
+            embed_model=Settings.embed_model,
+            show_progress=True
+        )
+        logger.info("✅ Векторный индекс создан")
+        
+        if self.use_graph:
+            logger.info("🏗️ Создание графового индекса...")
+            self._build_graph_index(chunk_documents)
+        
+        self._save_to_cache()
+        self._setup_query_engine()
+        self.is_initialized = True
+        logger.info("✅ Система готова!")
+    
+    def query(self, question: str, verbose: bool = False, page_filter: int = None) -> Dict[str, Any]:
+        """Гибридный поиск с объединением результатов"""
         if not self.query_engine:
             return {
                 "answer": "Ошибка: RAG не инициализирован.",
@@ -795,191 +1211,115 @@ class HybridRAG:
         
         try:
             start_time = time.time()
-            if verbose:
-                logger.info(f"📝 Запрос: {question}")
             
-            # ============================================================
-            # ИЗВЛЕКАЕМ НОМЕР СТРАНИЦЫ ИЗ ЗАПРОСА
-            # ============================================================
-            page_match = re.search(r'(\d+)\s*страниц[еы]|страниц[еы]\s*(\d+)', question, re.IGNORECASE)
+            # Проверка на запрос о странице
+            page_patterns = [
+                r'(?:про что|что|о чем|расскажи|информация|покажи|опиши)\s+(?:на|с|со|про)\s+(\d+)\s*(?:страниц[еы]|стр\.?)',
+                r'страниц[еы]\s*(\d+)\s+(?:про что|что|о чем)',
+                r'(\d+)\s*страниц[еы]\s*(?:про что|что|о чем)',
+                r'покажи\s+(\d+)\s*страниц[уы]',
+                r'страница\s+(\d+)\s*:?',
+                r'(\d+)\s*страница',
+            ]
+            
             requested_page = None
-            if page_match:
-                requested_page = int(page_match.group(1) or page_match.group(2))
-                logger.info(f"📄 Запрошена страница: {requested_page}")
+            is_page_query = False
+            
+            if page_filter is not None:
+                requested_page = page_filter
+                is_page_query = True
+            else:
+                for pattern in page_patterns:
+                    match = re.search(pattern, question.lower(), re.IGNORECASE)
+                    if match:
+                        requested_page = int(match.group(1))
+                        is_page_query = True
+                        break
+            
+            if is_page_query and requested_page:
+                page_content = self._get_page_content(requested_page)
+                
+                if page_content:
+                    answer = self._format_page_answer(requested_page, page_content, question)
+                    sources = self._get_page_sources(requested_page)
+                    
+                    structured = self._parse_structured_response(answer, sources)
+                    
+                    return {
+                        "answer": answer,
+                        "sources": sources,
+                        "structured": structured,
+                        "status": "success",
+                        "elapsed": time.time() - start_time,
+                        "sources_count": len(sources),
+                        "requested_page": requested_page,
+                        "page_mode": True,
+                        "hybrid_search": False,
+                    }
+                else:
+                    available_pages = self._get_available_pages()
+                    if available_pages:
+                        pages_str = ', '.join(str(p) for p in available_pages[:20])
+                        return {
+                            "answer": f"❌ **Страница {requested_page} не найдена** в документах.\n\n📚 **Доступные страницы:** {pages_str}",
+                            "sources": [],
+                            "status": "not_found",
+                            "elapsed": time.time() - start_time,
+                            "requested_page": requested_page,
+                            "available_pages": available_pages,
+                        }
+                    else:
+                        return {
+                            "answer": "❌ В документах нет страниц. Возможно, документы еще не спарсены.",
+                            "sources": [],
+                            "status": "not_found",
+                            "elapsed": time.time() - start_time,
+                        }
+            
+            # Гибридный запрос
+            logger.info(f"🔍 Гибридный поиск: {question[:100]}...")
             
             response = self.query_engine.query(question)
             answer = str(response)
+            sources = self._extract_sources(response)
+            
+            source_stats = {}
+            for src in sources:
+                source_type = src.get('source_type', 'unknown')
+                source_stats[source_type] = source_stats.get(source_type, 0) + 1
+            
+            if source_stats:
+                logger.info(f"📊 Методы поиска: {source_stats}")
+            
+            answer = self._clean_answer(answer)
             
             # ============================================================
-            # АГРЕССИВНАЯ ОЧИСТКА ОТ [Страница X] И ДУБЛИРОВАНИЙ
+            # ПАРСИМ СТРУКТУРИРОВАННЫЙ ОТВЕТ
             # ============================================================
-            # 1. Заменяем [Страница X] на "странице X"
-            answer = re.sub(r'\[Страница\s+(\d+)\]', r'странице \1', answer)
-            answer = re.sub(r'\[OCR Страница\s+(\d+)\]', r'странице \1', answer)
             
-            # 2. Убираем дублирование "странице странице" → "странице"
-            answer = re.sub(r'странице\s+странице', r'странице', answer, flags=re.IGNORECASE)
-            answer = re.sub(r'страница\s+страница', r'страница', answer, flags=re.IGNORECASE)
-            answer = re.sub(r'На\s+странице\s+странице', r'На странице', answer, flags=re.IGNORECASE)
+            structured = self._parse_structured_response(answer, sources)
             
-            # 3. Убираем "На странице [Страница 16]" → "На странице 16"
-            answer = re.sub(r'На\s+странице\s+\[Страница\s+(\d+)\]', r'На странице \1', answer, flags=re.IGNORECASE)
-            answer = re.sub(r'странице\s+\[Страница\s+(\d+)\]', r'странице \1', answer, flags=re.IGNORECASE)
+            if source_stats:
+                methods_info = ", ".join(source_stats.keys())
+                structured["search_methods"] = methods_info
             
-            # 4. Убираем "[Страница X] находится" → "находится на странице X"
-            answer = re.sub(r'\[Страница\s+(\d+)\]\s+находится', r'находится на странице \1', answer)
-            
-            # 5. Убираем "страница 16 находится" → "находится на странице 16"
-            answer = re.sub(r'страница\s+(\d+)\s+находится', r'находится на странице \1', answer, flags=re.IGNORECASE)
-            
-            # 6. Убираем лишние пробелы
-            answer = re.sub(r'\s+', ' ', answer)
-            answer = answer.strip()
-            
-            # 7. Если ответ начинается с "На странице странице" - исправляем
-            answer = re.sub(r'^На\s+странице\s+странице', r'На странице', answer, flags=re.IGNORECASE)
-            answer = re.sub(r'^На\s+странице\s+(\d+)', r'На странице \1', answer, flags=re.IGNORECASE)
-            
-            # 8. Если есть "[Страница X]" в любом месте - заменяем на "страница X"
-            answer = re.sub(r'\[Страница\s+(\d+)\]', r'страница \1', answer)
-            
-            # ============================================================
-            # СБОР ИСТОЧНИКОВ
-            # ============================================================
-            sources = []
-            sources_text = ""
-            
-            if hasattr(response, 'source_nodes'):
-                logger.info(f"📊 Найдено source_nodes: {len(response.source_nodes)}")
-                
-                for node in response.source_nodes[:5]:
-                    try:
-                        node_text = None
-                        node_page = None
-                        
-                        if hasattr(node, 'text') and node.text:
-                            node_text = node.text
-                        
-                        if not node_text and hasattr(node, 'node'):
-                            if hasattr(node.node, 'text') and node.node.text:
-                                node_text = node.node.text
-                        
-                        if not node_text:
-                            node_id = None
-                            if hasattr(node, 'node') and hasattr(node.node, 'node_id'):
-                                node_id = node.node.node_id
-                            elif hasattr(node, 'node_id'):
-                                node_id = node.node_id
-                            
-                            if node_id and hasattr(self.docstore, 'docs'):
-                                doc = self.docstore.docs.get(node_id)
-                                if doc and hasattr(doc, 'text') and doc.text:
-                                    node_text = doc.text
-                                    logger.debug(f"✅ Текст из docstore по ID {node_id}")
-                        
-                        if hasattr(node, 'metadata'):
-                            node_page = node.metadata.get('page')
-                        
-                        if not node_page and node_text:
-                            page_in_text = re.search(r'\[Страница (\d+)\]', node_text)
-                            if page_in_text:
-                                node_page = int(page_in_text.group(1))
-                        
-                        if node_text:
-                            source = {
-                                "text": node_text,
-                                "score": float(node.score) if hasattr(node, 'score') and node.score is not None else None,
-                                "metadata": node.metadata if hasattr(node, 'metadata') else {},
-                                "page": node_page,
-                            }
-                            
-                            if source['metadata'].get('source') == 'graph':
-                                logger.info(f"   🌐 Графовый источник: {node_text[:100]}...")
-                            
-                            sources.append(source)
-                            sources_text += node_text + " "
-                        
-                    except Exception as e:
-                        logger.warning(f"⚠️ Ошибка обработки источника: {e}")
-                        continue
-                
-                logger.info(f"📄 Получено источников: {len(sources)}")
-                if sources:
-                    first_text = sources[0].get('text', '')[:100]
-                    first_page = sources[0].get('page')
-                    logger.info(f"   Первый источник: {first_text}... (страница: {first_page})")
-            
-            # ============================================================
-            # ФИЛЬТРАЦИЯ ПО СТРАНИЦЕ
-            # ============================================================
-            if requested_page:
-                filtered_sources = [s for s in sources if s.get('page') == requested_page]
-                if filtered_sources:
-                    sources = filtered_sources
-                    logger.info(f"📄 Отфильтровано {len(sources)} источников на странице {requested_page}")
-                else:
-                    logger.warning(f"⚠️ Нет источников на странице {requested_page}")
-                    if "нет информации" not in answer.lower():
-                        page_in_answer = re.search(r'(\d+)\s*страниц[еы]', answer)
-                        if page_in_answer:
-                            wrong_page = int(page_in_answer.group(1))
-                            if wrong_page != requested_page:
-                                answer = answer.replace(f"на странице {wrong_page}", "").replace(f"на {wrong_page} странице", "").strip()
-                                if not answer:
-                                    answer = f"Информация на странице {requested_page} не найдена. Проверьте правильность номера страницы."
-            
-            # ============================================================
-            # ПОСТ-ОБРАБОТКА
-            # ============================================================
-            if "нет информации" in answer.lower() and sources:
-                logger.info("🔧 LLM сказал 'нет информации', но есть источники. Исправляем...")
-                
-                for source in sources:
-                    text = source.get('text', '')
-                    
-                    if "ЗАПРЕЩЕНО" in text:
-                        match = re.search(r'[^.]*ЗАПРЕЩЕНО[^.]*\.', text)
-                        if match:
-                            page_info = f" (страница {source.get('page')})" if source.get('page') else ""
-                            answer = match.group(0).strip() + page_info
-                            logger.info(f"🔧 Исправлен ответ (найдено ЗАПРЕЩЕНО): {answer}")
-                            break
-                    
-                    if "РАЗРЕШЕНО" in text:
-                        match = re.search(r'[^.]*РАЗРЕШЕНО[^.]*\.', text)
-                        if match:
-                            page_info = f" (страница {source.get('page')})" if source.get('page') else ""
-                            answer = match.group(0).strip() + page_info
-                            logger.info(f"🔧 Исправлен ответ (найдено РАЗРЕШЕНО): {answer}")
-                            break
-            
-            if "нет информации" in answer.lower() and sources:
-                for source in sources:
-                    text = source.get('text', '')
-                    if "Приложение 2" in text and "ЗАПРЕЩЕНО" in text:
-                        match = re.search(r'Приложение 2[^.]*ЗАПРЕЩЕНО[^.]*\.', text)
-                        if match:
-                            page_info = f" (страница {source.get('page')})" if source.get('page') else ""
-                            answer = match.group(0).strip() + page_info
-                            logger.info(f"🔧 Исправлен ответ (Приложение 2): {answer}")
-                            break
-            
-            if sources and not re.search(r'страниц[еы]', answer, re.IGNORECASE):
-                page_from_source = sources[0].get('page')
-                if page_from_source:
-                    if not re.search(rf'{page_from_source}\s*страниц[еы]', answer, re.IGNORECASE):
-                        answer = f"{answer} (страница {page_from_source})"
-            
-            elapsed = time.time() - start_time
-            logger.info(f"⏱️ Время ответа: {elapsed:.2f}с")
+            # Логируем результат парсинга для отладки
+            logger.info(f"📝 Структурированный ответ: title={structured.get('title')}, "
+                        f"paragraphs={len(structured.get('paragraphs', []))}, "
+                        f"lists={len(structured.get('lists', []))}, "
+                        f"code_blocks={len(structured.get('code_blocks', []))}")
             
             return {
                 "answer": answer,
                 "sources": sources,
+                "structured": structured,  # ← КЛЮЧЕВАЯ СТРОКА
                 "status": "success",
-                "elapsed": elapsed,
+                "elapsed": time.time() - start_time,
                 "sources_count": len(sources),
-                "requested_page": requested_page,
+                "source_stats": source_stats,
+                "hybrid_search": True,
+                "methods_used": list(source_stats.keys()) if source_stats else ['vector'],
+                "page_mode": False,
             }
             
         except Exception as e:
@@ -989,41 +1329,143 @@ class HybridRAG:
                 "sources": [],
                 "status": "error"
             }
-
+    
+    def _get_page_content(self, page_num: int) -> Optional[str]:
+        chunks = self.chunk_manager.get_chunks_by_page(page_num)
+        if not chunks:
+            return None
+        chunks.sort(key=lambda x: x['metadata']['chunk_index'])
+        return '\n\n'.join([chunk['text'] for chunk in chunks])
+    
+    def _get_page_sources(self, page_num: int) -> List[Dict[str, Any]]:
+        chunks = self.chunk_manager.get_chunks_by_page(page_num)
+        sources = []
+        for chunk in chunks:
+            sources.append({
+                "text": chunk['text'],
+                "metadata": chunk['metadata'],
+                "page": page_num,
+                "source": chunk['metadata'].get('source', 'unknown'),
+            })
+        return sources
+    
+    def _format_page_answer(self, page_num: int, content: str, question: str) -> str:
+        headers = []
+        header_patterns = [
+            r'^([А-ЯЁ][А-ЯЁ\s\d.]+[А-ЯЁ])',
+            r'^(\d+\.\d+\s+[А-ЯЁ][а-яё\s\d]+)',
+            r'^(\d+\s+[А-ЯЁ][а-яё\s\d]+)',
+            r'^(Приложение\s+\d+[\.\s]*[А-ЯЁа-яё\s\d]+)',
+        ]
+        
+        for pattern in header_patterns:
+            matches = re.findall(pattern, content, re.MULTILINE)
+            headers.extend(matches)
+        headers = list(dict.fromkeys(headers))
+        
+        answer_parts = []
+        answer_parts.append(f"📄 **Страница {page_num}**\n")
+        
+        if headers:
+            answer_parts.append("**Содержание страницы:**")
+            for header in headers[:10]:
+                answer_parts.append(f"  • {header.strip()}")
+            answer_parts.append("")
+        
+        paragraphs = content.split('\n\n')
+        if paragraphs:
+            first_paragraph = paragraphs[0][:500]
+            answer_parts.append(f"**Начало текста:**\n{first_paragraph}...")
+        
+        sources = self._get_page_sources(page_num)
+        if sources:
+            source_names = list(set([s['source'] for s in sources]))
+            answer_parts.append(f"\n📚 **Источники:** {', '.join(source_names)}")
+        
+        return '\n'.join(answer_parts)
+    
+    def _extract_sources(self, response) -> List[Dict[str, Any]]:
+        sources = []
+        if hasattr(response, 'source_nodes'):
+            for node in response.source_nodes[:10]:
+                try:
+                    node_text = None
+                    node_page = None
+                    node_metadata = {}
+                    source_type = None
+                    
+                    if hasattr(node, 'text') and node.text:
+                        node_text = node.text
+                    elif hasattr(node, 'node') and hasattr(node.node, 'text'):
+                        node_text = node.node.text
+                    
+                    if hasattr(node, 'metadata'):
+                        node_metadata = node.metadata
+                        node_page = node.metadata.get('page')
+                        source_type = node.metadata.get('retriever_source')
+                    
+                    if not node_page and node_text:
+                        page_in_text = re.search(r'\[Страница (\d+)\]', node_text)
+                        if page_in_text:
+                            node_page = int(page_in_text.group(1))
+                    
+                    if node_text:
+                        sources.append({
+                            "text": node_text,
+                            "score": float(node.score) if hasattr(node, 'score') and node.score is not None else None,
+                            "metadata": node_metadata,
+                            "page": node_page,
+                            "source_type": source_type,
+                        })
+                except Exception:
+                    continue
+        return sources
+    
+    def _clean_answer(self, answer: str) -> str:
+        answer = re.sub(r'\[Страница\s+(\d+)\]', r'страница \1', answer)
+        answer = re.sub(r'\[OCR Страница\s+(\d+)\]', r'страница \1', answer)
+        answer = re.sub(r'\s+', ' ', answer).strip()
+        return answer
+    
+    def _get_available_pages(self) -> List[int]:
+        return self.chunk_manager.get_available_pages()
+    
     def ask(self, question: str) -> str:
-        """Простой метод для получения ответа"""
         result = self.query(question)
         return result.get('answer', 'Нет ответа')
-
+    
     def get_stats(self) -> Dict[str, Any]:
-        """Статистика системы"""
-        stats = {
+        docs_count = len(self._get_nodes()) if self._get_nodes() else 0
+        
+        methods = ['vector', 'bm25']
+        if self.use_graph:
+            methods.append('graph')
+        
+        return {
             'collection': Config.QDRANT_COLLECTION,
-            'docstore_file': str(DOCSTORE_FILE) if DOCSTORE_FILE.exists() else None,
-            'docstore_size': DOCSTORE_FILE.stat().st_size if DOCSTORE_FILE.exists() else 0,
-            'documents_in_docstore': len(list(self.docstore.docs.values())) if hasattr(self.docstore, 'docs') else 0,
-            'vector_index_loaded': self.vector_index is not None,
-            'keyword_index_loaded': self.keyword_index is not None,
-            'graph_index_loaded': self.graph_index is not None,
-            'query_engine_ready': self.query_engine is not None,
             'is_initialized': self.is_initialized,
-            'use_graph': self.use_graph and GRAPH_AVAILABLE,
-            'graph_available': GRAPH_AVAILABLE,
+            'chunks_count': len(self.chunk_manager._chunks_cache) if self.chunk_manager else 0,
+            'pages_available': self._get_available_pages(),
+            'documents_in_docstore': docs_count,
+            'nodes_for_keyword': docs_count,
+            'qdrant_points': self._check_qdrant(),
             'search_k': SEARCH_K,
-            'cache_dir': str(CACHE_DIR),
-            'docstore_dir': str(DOCSTORE_DIR),
+            'use_graph': self.use_graph,
+            'graph_available': GRAPH_AVAILABLE,
+            'hybrid_retriever': self.hybrid_retriever is not None,
+            'methods': methods
         }
-        
-        if self._check_qdrant():
-            try:
-                info = self.qdrant_client.get_collection(Config.QDRANT_COLLECTION)
-                stats['qdrant_points'] = info.points_count
-            except Exception:
-                pass
-        
-        return stats
+    
+    def set_search_weights(self, vector: float = None, bm25: float = None, graph: float = None):
+        if hasattr(self.hybrid_retriever, 'set_weights'):
+            self.hybrid_retriever.set_weights(vector, bm25, graph)
+            logger.info("⚖️ Веса поиска обновлены")
+            self._setup_query_engine()
 
 
-# Глобальный экземпляр
+# ================================================================
+# ГЛОБАЛЬНЫЙ ЭКЗЕМПЛЯР
+# ================================================================
+
 rag_agent = HybridRAG()
-logger.info("✅ RAG агент создан с расширенным графовым поиском")
+logger.info("✅ RAG агент создан с ГИБРИДНЫМ поиском (Vector + BM25 + Graph)")

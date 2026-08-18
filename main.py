@@ -69,6 +69,7 @@ class ChatResponse(BaseModel):
     conversationId: Optional[str] = None
     processingTime: Optional[float] = None
     tokensUsed: Optional[int] = None
+    structured: Optional[Dict[str, Any]] = None  # ← ДОБАВЛЕНО
 
 class QueryRequest(BaseModel):
     """Запрос к супервизору"""
@@ -175,6 +176,9 @@ async def chat(
         # Отправляем запрос через супервизор
         result = supervisor.process(request.message)
         
+        # Извлекаем structured из результата
+        structured = result.get('structured')
+        
         # Формируем ответ
         return ChatResponse(
             success=result.get('status') != 'error',
@@ -184,7 +188,8 @@ async def chat(
             sources=result.get('details', {}).get('result', {}).get('sources'),
             conversationId=result.get('details', {}).get('conversationId'),
             processingTime=result.get('details', {}).get('processingTime'),
-            tokensUsed=result.get('details', {}).get('tokensUsed')
+            tokensUsed=result.get('details', {}).get('tokensUsed'),
+            structured=structured
         )
         
     except Exception as e:
@@ -227,6 +232,11 @@ async def chat_stream(
             response_text = result.get('result', 'Нет ответа')
             agent_name = result.get('agent', 'unknown')
             
+            # Извлекаем structured
+            structured = None
+            if result.get('details') and isinstance(result['details'], dict):
+                structured = result['details'].get('structured')
+            
             # Отправляем по частям (имитация стрима)
             chunks = response_text.split('. ')
             for i, chunk in enumerate(chunks):
@@ -241,7 +251,7 @@ async def chat_stream(
                     await asyncio.sleep(0.1)
             
             # Отправляем метаданные
-            yield f"data: {json.dumps({'metadata': {'agent': agent_name, 'conversationId': result.get('details', {}).get('conversationId')}})}\n\n"
+            yield f"data: {json.dumps({'metadata': {'agent': agent_name, 'conversationId': result.get('details', {}).get('conversationId'), 'structured': structured}})}\n\n"
             
             # Сигнал завершения
             yield "data: [DONE]\n\n"
@@ -365,7 +375,8 @@ async def test_rag_query():
             results.append({
                 "query": query,
                 "answer": result.get("answer", "Нет ответа")[:200] + "..." if len(result.get("answer", "")) > 200 else result.get("answer", ""),
-                "sources_count": len(result.get("sources", []))
+                "sources_count": len(result.get("sources", [])),
+                "structured": result.get("structured")  # ← ДОБАВЛЕНО
             })
         
         return {
@@ -465,6 +476,81 @@ async def get_current_user():
         "contractorName": "ООО Тестовая Компания",
         "roles": ["user"]
     }
+
+# ============================================================================
+# ГИБРИДНЫЙ ПОИСК - ДОПОЛНИТЕЛЬНЫЕ ЭНДПОИНТЫ
+# ============================================================================
+
+@app.get("/rag/hybrid/stats")
+async def get_hybrid_stats():
+    """Получить статистику гибридного поиска"""
+    try:
+        stats = rag_agent.get_stats()
+        return {
+            "status": "success",
+            "hybrid_search": True,
+            "stats": stats,
+            "methods": stats.get('methods', ['vector', 'keyword', 'bm25']),
+            "use_graph": stats.get('use_graph', False)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/rag/hybrid/weights")
+async def set_hybrid_weights(
+    vector: Optional[float] = None,
+    keyword: Optional[float] = None,
+    bm25: Optional[float] = None,
+    graph: Optional[float] = None
+):
+    """
+    Установить веса для методов гибридного поиска
+    
+    - vector: вес векторного поиска (по умолчанию 1.0)
+    - keyword: вес TF-IDF поиска (по умолчанию 0.7)
+    - bm25: вес BM25 поиска (по умолчанию 0.8)
+    - graph: вес графового поиска (по умолчанию 0.5)
+    """
+    try:
+        rag_agent.set_search_weights(vector, keyword, bm25, graph)
+        return {
+            "status": "success",
+            "message": "Веса обновлены",
+            "weights": rag_agent.hybrid_retriever.weights if rag_agent.hybrid_retriever else {}
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/rag/hybrid/test")
+async def test_hybrid_search():
+    """Тест гибридного поиска с разными методами"""
+    try:
+        test_queries = [
+            "Что такое политика работы с поставщиками?",
+            "Какие правила оформления заказов?",
+            "Как осуществляется отбор поставщиков?"
+        ]
+        
+        results = []
+        for query in test_queries:
+            result = rag_agent.query(query)
+            results.append({
+                "query": query,
+                "answer": result.get("answer", "Нет ответа")[:200] + "..." if len(result.get("answer", "")) > 200 else result.get("answer", ""),
+                "sources_count": result.get("sources_count", 0),
+                "methods_used": result.get("methods_used", ['vector']),
+                "hybrid_search": result.get("hybrid_search", False),
+                "elapsed": result.get("elapsed", 0),
+                "structured": result.get("structured")  # ← ДОБАВЛЕНО
+            })
+        
+        return {
+            "status": "success",
+            "results": results,
+            "stats": rag_agent.get_stats()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================================================
 # ЗАПУСК
