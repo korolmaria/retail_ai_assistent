@@ -1,0 +1,14 @@
+{
+  "timestamp": "20260818_171203",
+  "num_samples": 1,
+  "elapsed_seconds": 36.76499915122986,
+  "metrics": {
+    "faithfulness": 0.0,
+    "answer_relevancy": 0.3293587756035693,
+    "context_precision": 0.0,
+    "context_recall": 1.0
+  },
+  "dataset_path": "/Users/mariakorol/Desktop/retail_ai_core/data/datasets/test_dataset.json",
+  "model": "qwen2.5-7b-instruct",
+  "embedding_model": "/Users/mariakorol/Desktop/retail_ai_core/models/embeddings/bge-m3"
+}

@@ -1,6 +1,4 @@
 # src/rag_engine.py
-
-import nest_asyncio
 import pickle
 import hashlib
 import json
@@ -24,8 +22,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-nest_asyncio.apply()
-
 import qdrant_client
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as qdrant_models
@@ -40,7 +36,6 @@ from llama_index.core import (
     VectorStoreIndex,
 )
 from llama_index.core.storage.docstore import SimpleDocumentStore
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.vector_stores.qdrant import QdrantVectorStore
 from llama_index.core.postprocessor import SentenceTransformerRerank
 from llama_index.core.response_synthesizers import TreeSummarize
@@ -49,6 +44,11 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.retrievers import VectorIndexRetriever
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.schema import NodeWithScore, TextNode
+
+# ================================================================
+# ИМПОРТ ДЛЯ ЭМБЕДДИНГОВ
+# ================================================================
+from sentence_transformers import SentenceTransformer
 
 # ================================================================
 # ИМПОРТ НАШЕГО ПАРСЕРА И КОНФИГА
@@ -87,27 +87,56 @@ except ImportError as e:
     GRAPH_AVAILABLE = False
 
 # ================================================================
+# КЛАСС ДЛЯ ЭМБЕДДИНГОВ
+# ================================================================
+
+class CustomEmbedding:
+    """Обертка для модели эмбеддингов через sentence-transformers"""
+    
+    def __init__(self, model_name: str, device: str = "cpu"):
+        self.model = SentenceTransformer(model_name, device=device)
+        self.embed_batch_size = 32
+        logger.info(f"✅ Модель эмбеддингов загружена: {model_name}")
+    
+    def get_text_embedding(self, text: str) -> List[float]:
+        """Получить эмбеддинг для одного текста"""
+        return self.model.encode(text, normalize_embeddings=True).tolist()
+    
+    def get_text_embedding_batch(self, texts: List[str], **kwargs) -> List[List[float]]:
+        """Получить эмбеддинги для нескольких текстов"""
+        return self.model.encode(texts, normalize_embeddings=True).tolist()
+    
+    def get_agg_embedding_from_queries(self, queries: List[str]) -> List[float]:
+        """
+        Агрегирует эмбеддинги для нескольких запросов (для Qdrant)
+        """
+        if not queries:
+            return []
+        embeddings = self.model.encode(queries, normalize_embeddings=True)
+        # Усредняем эмбеддинги
+        import numpy as np
+        return np.mean(embeddings, axis=0).tolist()
+
+# ================================================================
 # НАСТРОЙКИ
 # ================================================================
 
 # Загрузка модели эмбеддингов
 try:
     logger.info(f"🔄 Загрузка модели эмбеддингов: {Config.EMBEDDING_MODEL}")
-    Settings.embed_model = HuggingFaceEmbedding(
-        model_name=str(Config.EMBEDDING_MODEL),
-        device=Config.EMBEDDING_DEVICE,
-        trust_remote_code=True,
-        cache_folder=str(Config.MODELS_DIR / "embeddings"),
+    Settings.embed_model = CustomEmbedding(
+        str(Config.EMBEDDING_MODEL),
+        Config.EMBEDDING_DEVICE
     )
-    logger.info("✅ Модель эмбеддингов загружена")
+    logger.info("✅ Модель bge-m3 успешно загружена")
 except Exception as e:
-    logger.error(f"❌ Ошибка загрузки модели: {e}")
+    logger.error(f"❌ Ошибка загрузки bge-m3: {e}")
     logger.warning("⚠️ Используем fallback модель")
-    Settings.embed_model = HuggingFaceEmbedding(
-        model_name="sentence-transformers/all-MiniLM-L6-v2",
-        device=Config.EMBEDDING_DEVICE,
-        trust_remote_code=True,
+    Settings.embed_model = CustomEmbedding(
+        "sentence-transformers/all-MiniLM-L6-v2",
+        Config.EMBEDDING_DEVICE
     )
+    logger.info("✅ Fallback модель загружена")
 
 Settings.chunk_size = Config.CHUNK_SIZE
 Settings.chunk_overlap = Config.CHUNK_OVERLAP
@@ -1053,7 +1082,10 @@ class HybridRAG:
 ## ИНСТРУКЦИИ:
 1. Отвечай ТОЛЬКО на основе контекста.
 2. Форматируй ответ так, чтобы он был удобен для чтения.
-3. НЕ добавляй источники в ответ.
+3. **В КОНЦЕ ОТВЕТА ОБЯЗАТЕЛЬНО УКАЖИ ИСТОЧНИКИ** в формате:
+   - Источник: [название файла], страница [номер]
+   - Если несколько источников, перечисли их все.
+
 
 ## ТВОЙ ОТВЕТ:"""
         
@@ -1073,7 +1105,7 @@ class HybridRAG:
         logger.info("✅ Query engine настроен (Vector + BM25 + Graph, параллельный режим)")
     
     # ============================================================
-    # НОВЫЙ МЕТОД: ПАРСИНГ СТРУКТУРИРОВАННОГО ОТВЕТА
+    # МЕТОД: ПАРСИНГ СТРУКТУРИРОВАННОГО ОТВЕТА
     # ============================================================
     
     def _parse_structured_response(self, answer: str, sources: List[Dict]) -> Dict[str, Any]:
@@ -1312,7 +1344,7 @@ class HybridRAG:
             return {
                 "answer": answer,
                 "sources": sources,
-                "structured": structured,  # ← КЛЮЧЕВАЯ СТРОКА
+                "structured": structured,
                 "status": "success",
                 "elapsed": time.time() - start_time,
                 "sources_count": len(sources),

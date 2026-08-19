@@ -1,0 +1,12 @@
+{
+  "timestamp": "20260818_172937",
+  "num_samples": 1,
+  "metrics": {
+    "faithfulness": NaN,
+    "answer_relevancy": NaN,
+    "context_precision": 0.0,
+    "context_recall": NaN
+  },
+  "model": "flan-t5-small",
+  "embedding_model": "/Users/mariakorol/Desktop/retail_ai_core/models/embeddings/bge-m3"
+}
