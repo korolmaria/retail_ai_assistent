@@ -26,12 +26,12 @@ python3 scripts/evaluate_ragas.py
 
 ### Тест 1: Прямой вопрос (факт на одной странице)
 
-![Тест 1](data/screenshots/1.png)
+![Тест 1](data/screenshorts/1.png)
 **Результат:** ✅ **УСПЕШНО**
 ---
 
 ### Тест 2: Вопрос с агрегацией (из разных страниц)
-![Тест 2](data/screenshots/2.png)
+![Тест 2](data/screenshorts/2.png)
 
 **Результат:** ✅ **УСПЕШНО**
 
