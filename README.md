@@ -117,5 +117,4 @@ python3 scripts/evaluate_ragas.py
 | Модель эмбеддингов | BAAI/bge-m3 |
 | Векторная БД | Qdrant |
 | Графовая БД | Neo4j |
-| Тестов пройдено | 7/7 (100%) |
 
